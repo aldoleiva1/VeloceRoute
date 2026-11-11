@@ -27,6 +27,7 @@ and re-advertise path.
 | 2 | Debug-log arguments built only when debug is on | `pkg/server/peer.go` | Removes per-route string formatting on a transit router |
 | 3 | Append-style NLRI writer, one buffer per UPDATE | `pkg/packet/bgp/bgp.go` | UPDATE encode allocations 26 to 17 (1 prefix), 184 to 17 (40 prefixes) |
 | 4 | Exact-size attribute buffers, header and body in one buffer, pooled AS-path scratch | `pkg/packet/bgp/bgp.go` | Encode allocations 17 to 10 |
+| 5 | Decode: one slab of prefix structs and one exactly-sized slice per UPDATE | `pkg/packet/bgp/bgp.go` | Decode allocations for 40 prefixes 69 to 24; no change for 1 prefix |
 
 Cumulative lab result, upstream vs changes 1 and 2 (r2, 900k routes, n=3 each,
 interleaved runs, fresh daemons per run):
@@ -122,6 +123,56 @@ returned. In practice:
   returned message and live in the RIB. The decode-side plan is batch
   allocation (one slab of structs per UPDATE), not pooling.
 
+## 5. Decode: batch allocation of prefixes (`pkg/packet/bgp/bgp.go`)
+
+**What upstream did.** `BGPUpdate.DecodeFromBytes` allocated one `IPAddrPrefix`
+per withdrawn route and per NLRI prefix, and grew the `PathNLRI` slice with
+`append`. The profile of a 40-prefix UPDATE put 59% of decode allocations on the
+`&IPAddrPrefix{}` line and another 10% on the slice growth. The withdrawn-routes
+slice was also created with a capacity equal to the withdrawn length in *bytes*.
+
+**What the code does now.**
+
+- `countIPv4NLRI` walks only the length octets of the withdrawn and NLRI fields
+  and returns how many prefixes they appear to hold (add-path aware). It is a
+  capacity hint, not validation: it stops at the first prefix that does not fit.
+- `prefixSlab` allocates `[]IPAddrPrefix` once for that count, and `next()` hands
+  out elements. If the hint was too small (malformed input) it falls back to a
+  normal `&IPAddrPrefix{}`, so a wrong hint only costs an allocation.
+- The `PathNLRI` slices are created with the exact capacity, so no regrowth.
+- The decode loops are unchanged and still do all validation and produce the
+  same errors. Empty fields remain non-nil empty slices as before.
+
+**Why a slab and not `sync.Pool`.** Decoded prefixes become part of the message
+and then the RIB, so they outlive the call and cannot be returned to a pool.
+Batch allocation is the safe equivalent. Elements of a slab are distinct memory,
+so there is no aliasing between prefixes. The trade-off: while any prefix of an
+UPDATE is still referenced, the whole slab stays reachable. That is bounded by
+one UPDATE (at most about 800 prefixes in a 4096-octet message) and in practice
+all prefixes of an UPDATE live as long as each other.
+
+**Verification.** `TestUpdateDecodeSlabMatchesLegacy` runs 4000 random withdrawn
+and NLRI fields (add-path on and off, a third of them corrupted by byte flips,
+truncation or trailing junk) and requires the same prefixes, ids and
+success/failure as a copy of the old loop. `TestUpdateDecodeSlabNoAliasing`
+checks that changing one decoded prefix leaves its neighbours alone and that no
+two entries share a pointer. A deliberate bug (every element pointing at the
+first) was caught by both tests.
+
+**Result.** Decode, median of 8:
+
+| case | before | after |
+|---|---|---|
+| 1 prefix | 530 ns, 664 B, 24 allocs | 530 ns, 664 B, 24 allocs |
+| 40 prefixes | 1952 ns, 5320 B, 69 allocs | 1115 ns, 3040 B, 24 allocs |
+
+**Lab result: no measurable change** (r2, 900k routes, scratch n=6 vs decode n=3:
+mallocs/route 140.0 vs 139.9, CPU 34.4 vs 33.2 s, converge 13.3 vs 12.9 s, all
+within run spread). This is expected: `feedgen` puts one prefix in each UPDATE, and
+with one prefix the slab saves nothing. The change should matter on real tables
+where many prefixes share attributes; proving that needs the shared-attribute
+mode for `feedgen` (not built yet). IPv6 (`MP_REACH_NLRI`) decode is not changed.
+
 ## How it was verified
 
 - **Byte-for-byte equivalence** (`pkg/packet/bgp/nlri_append_test.go`). The file
@@ -148,7 +199,7 @@ returned. In practice:
   |---|---|---|---|
   | encode 1 prefix | 475 ns, 600 B, 26 allocs | 349 ns, 472 B, 17 allocs | 262 ns, 344 B, 10 allocs |
   | encode 40 prefixes | 2764 ns, 2272 B, 184 allocs | 622 ns, 968 B, 17 allocs | 522 ns, 664 B, 10 allocs |
-  | decode 1 / 40 prefixes | 24 / 69 allocs | unchanged | unchanged |
+  | decode 1 / 40 prefixes | 24 / 69 allocs | unchanged | unchanged (24 / 24 after change 5) |
 
 - **Known unrelated test failures on macOS:** `TestDisableMrt`, `TestEBGPRouteStuck`,
   `TestRTCDeferralTimerRaceCondition` and `TestTcpAoUpdatePeerWithClosedConnection`
@@ -186,8 +237,8 @@ records r2/r3 runtime metrics from Prometheus on :6060).
 
 Tracked in [`ROADMAP.md`](../../ROADMAP.md):
 
-- Decode-side allocation (24 / 69 allocations per UPDATE): batch allocation of
-  prefix structs (E1-2).
+- Decode: IPv6 (`MP_REACH_NLRI`) prefixes, the per-attribute allocations and the
+  attribute-presence map are untouched (24 allocations per UPDATE remain). E1-2.
 - Remaining 10 encode allocations: the per-UPDATE attribute-presence map, the
   options slice and small per-attribute buffers.
 - Table-layer allocations (E1-3), `notifyBestWatcher` with no watchers (E1-4),

@@ -14,7 +14,7 @@ Status of the product features and the task areas. A task is **done** only when 
 | Lab (3 routers, feed injector, dashboard, A/B tooling) | Working | `lab/`; `ab.sh`, `run-ab2.sh`, `summarize.py` | E6-3, E6-1 |
 | Blueprint corrected to v4 and checked against AWS docs | Done (A-3) | `docs/veloceroute/blueprint.md`, compiling sample | E5-1 |
 | A-1 variance runs | Done | 3x3 upstream vs branch in `lab/results/` | none |
-| E1 performance | In progress | Server fixes; encode path (allocations 26 to 10 per UPDATE). See `docs/veloceroute/performance.md` | E1-2 decode, E1-3, E1-4, E1-5 |
+| E1 performance | In progress | Server fixes; encode path (allocations 26 to 10 per UPDATE); decode slab for IPv4 prefixes (40-prefix UPDATE 69 to 24 allocs). See `docs/veloceroute/performance.md` | shared-attribute `feedgen` to show the multi-prefix gain, then E1-3, E1-4, E1-5 |
 | E1-1 encode `sync.Pool` | Mostly done | Append writer, exact buffers, pooled AS-path scratch. `NewBGPUpdateMessage` and the attribute-presence map are untouched | finish remaining 10 allocations |
 | Single static binary (`veloced`, E2) | Not started | none | E2-1 (needs A-4 decision) |
 | gRPC API and OpenConfig | Upstream only | GoBGP's own API; no WireGuard or FIB additions | E7 after E3/E4 |
@@ -62,7 +62,7 @@ Baseline to beat (r2, 900k import, mean of 3, upstream): 193.8 mallocs/route, 8.
 | ID | Task | Done when | deps |
 |---|---|---|---|
 | E1-1 | **Mostly done.** `sync.Pool` for UPDATE **encode** buffers and temp slices: `BGPUpdate.Serialize`, `PathAttribute.Serialize`, `PathAttributeAsPath.Serialize`, `NewBGPUpdateMessage` | `go test -bench` in `pkg/packet/bgp` shows fewer allocs/op; lab run shows lower mallocs/route; tests pass with `-race` | A-1 |
-| E1-2 | `sync.Pool` for UPDATE **decode** scratch (`BGPUpdate.DecodeFromBytes`, `parseBody`) with safe release rules (nothing may alias a pooled buffer after release) | Same as E1-1, plus a test that fails if a pooled buffer is retained | E1-1 |
+| E1-2 | **Partly done** (IPv4 prefix slab; IPv6 and per-attribute allocations remain). `sync.Pool` for UPDATE **decode** scratch (`BGPUpdate.DecodeFromBytes`, `parseBody`) with safe release rules (nothing may alias a pooled buffer after release) | Same as E1-1, plus a test that fails if a pooled buffer is retained | E1-1 |
 | E1-3 | Table layer allocations: lazy `NewBitmap`, avoid `Path.Clone` for read-only use, `clonePathList`, `dstsToPaths` | Profile diff shows these frames drop; tests pass | A-1 |
 | E1-4 | `notifyBestWatcher`: skip building events when there are no watchers | No allocations from it with zero watchers; tests pass | none |
 | E1-5 | `GOGC` / `GOMEMLIMIT` experiments on the 900k run (no code change) | Table of settings vs CPU, RSS, converge time; recommended default documented | A-1 |

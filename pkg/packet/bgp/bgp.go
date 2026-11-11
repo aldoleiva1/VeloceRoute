@@ -17483,6 +17483,51 @@ type BGPUpdate struct {
 	NLRI                  []PathNLRI
 }
 
+// countIPv4NLRI returns how many IPv4 prefixes data appears to hold, so that
+// DecodeFromBytes can allocate the prefix structs and the PathNLRI slice once
+// per UPDATE. It only looks at the length octets and stops at the first prefix
+// that does not fit; it is a capacity hint, not validation. The decode loop
+// still checks every prefix, so malformed input just ends up with a hint that
+// is too small and falls back to a single allocation per extra prefix.
+func countIPv4NLRI(data []byte, addpathLen int) int {
+	n := 0
+	for len(data) > addpathLen {
+		step := addpathLen + 1 + (int(data[addpathLen])+7)/8
+		if step > len(data) {
+			break
+		}
+		data = data[step:]
+		n++
+	}
+	return n
+}
+
+// prefixSlab hands out IPAddrPrefix values from one backing array. The decoded
+// prefixes of an UPDATE end up in separate paths, usually all alive together,
+// so sharing an array costs nothing in practice; a prefix that outlives its
+// siblings keeps the array reachable, which is bounded by one UPDATE
+// (at most a few hundred bytes of prefixes per 4096-octet message).
+type prefixSlab struct {
+	buf []IPAddrPrefix
+	n   int
+}
+
+func newPrefixSlab(count int) prefixSlab {
+	if count <= 0 {
+		return prefixSlab{}
+	}
+	return prefixSlab{buf: make([]IPAddrPrefix, count)}
+}
+
+func (s *prefixSlab) next() *IPAddrPrefix {
+	if s.n < len(s.buf) {
+		p := &s.buf[s.n]
+		s.n++
+		return p
+	}
+	return &IPAddrPrefix{}
+}
+
 func (msg *BGPUpdate) DecodeFromBytes(data []byte, options ...*MarshallingOption) error {
 	var strongestError error
 
@@ -17508,7 +17553,9 @@ func (msg *BGPUpdate) DecodeFromBytes(data []byte, options ...*MarshallingOption
 		addpathLen = 4
 	}
 
-	msg.WithdrawnRoutes = make([]PathNLRI, 0, msg.WithdrawnRoutesLen)
+	wcount := countIPv4NLRI(data[:msg.WithdrawnRoutesLen], addpathLen)
+	msg.WithdrawnRoutes = make([]PathNLRI, 0, wcount)
+	wslab := newPrefixSlab(wcount)
 	for routelen := msg.WithdrawnRoutesLen; routelen > 0; {
 		id := uint32(0)
 		if addpathLen != 0 {
@@ -17518,7 +17565,7 @@ func (msg *BGPUpdate) DecodeFromBytes(data []byte, options ...*MarshallingOption
 			id = binary.BigEndian.Uint32(data[:4])
 			data = data[4:]
 		}
-		w := &IPAddrPrefix{}
+		w := wslab.next()
 		err := w.decodeFromBytes(data, net.IPv4len, options...)
 		if err != nil {
 			return err
@@ -17627,7 +17674,9 @@ func (msg *BGPUpdate) DecodeFromBytes(data []byte, options ...*MarshallingOption
 		}
 	}
 
-	msg.NLRI = make([]PathNLRI, 0)
+	ncount := countIPv4NLRI(data, addpathLen)
+	msg.NLRI = make([]PathNLRI, 0, ncount)
+	nslab := newPrefixSlab(ncount)
 	for restlen := len(data); restlen > 0; {
 		id := uint32(0)
 		if addpathLen != 0 {
@@ -17637,7 +17686,7 @@ func (msg *BGPUpdate) DecodeFromBytes(data []byte, options ...*MarshallingOption
 			id = binary.BigEndian.Uint32(data[:4])
 			data = data[4:]
 		}
-		n := &IPAddrPrefix{}
+		n := nslab.next()
 		err := n.decodeFromBytes(data, net.IPv4len, options...)
 		if err != nil {
 			return err
