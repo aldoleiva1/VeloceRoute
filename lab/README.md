@@ -30,3 +30,11 @@ Management IPs are pinned to 10.250.0.11-13. gobgpd serves Prometheus and pprof 
 `ab.sh` restarts gobgpd on r1-r3 with the given binary, waits for the old process to exit and for both sessions to establish, then runs `baseline.sh`. Results go to `results/<label>-run<N>-<timestamp>.txt`. Allocation counts per route are deterministic; CPU and convergence time vary 10-15% run to run on a laptop, so use at least 3 runs. See `../docs/veloceroute/performance.md` for what has been measured.
 
 By default `feedgen` gives every prefix its own AS path (one prefix per UPDATE). For a more realistic feed where about 37 prefixes share each UPDATE, set `FEEDGEN_ARGS`: `FEEDGEN_ARGS="-share 40" ./run-ab2.sh ...` (or `run-ab3.sh` for three builds). The summary then also shows `routes/UPDATE`. `baseline.sh` copies `feedgen-linux` to r1 on every run, so rebuild it after changing the generator.
+
+## Runtime settings (GOGC / GOMEMLIMIT)
+
+    # one build under several environment settings, interleaved
+    FEEDGEN_ARGS="-share 40" ./run-matrix.sh gobgpd-decode 3 "gc-default|" "gc200|GOGC=200" "gc400|GOGC=400"
+    python3 summarize.py gc-default gc200 gc400
+
+`GOBGPD_ENV` (used by `ab.sh`) sets variables in the environment of every gobgpd. `summarize.py` also reports `Go sys MB` (memory the Go runtime obtained from the OS, close to peak) and `routes/UPDATE`.

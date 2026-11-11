@@ -14,7 +14,7 @@ Status of the product features and the task areas. A task is **done** only when 
 | Lab (3 routers, feed injector, dashboard, A/B tooling) | Working | `lab/`; `ab.sh`, `run-ab2.sh`, `summarize.py` | E6-3, E6-1 |
 | Blueprint corrected to v4 and checked against AWS docs | Done (A-3) | `docs/veloceroute/blueprint.md`, compiling sample | E5-1 |
 | A-1 variance runs | Done | 3x3 upstream vs branch in `lab/results/` | none |
-| E1 performance | In progress | Server fixes; encode path (allocations 26 to 10 per UPDATE); decode slab for IPv4 prefixes (40-prefix UPDATE 69 to 24 allocs). See `docs/veloceroute/performance.md` | E1-3, E1-4, E1-5 (shared-attribute `feedgen -share` is done) |
+| E1 performance | In progress | Server fixes; encode path (allocations 26 to 10 per UPDATE); decode slab for IPv4 prefixes (40-prefix UPDATE 69 to 24 allocs). See `docs/veloceroute/performance.md` | E1-3, E1-4 (shared-attribute `feedgen -share` and the GOGC experiments are done) |
 | E1-1 encode `sync.Pool` | Mostly done | Append writer, exact buffers, pooled AS-path scratch. `NewBGPUpdateMessage` and the attribute-presence map are untouched | finish remaining 10 allocations |
 | Single static binary (`veloced`, E2) | Not started | none | E2-1 (needs A-4 decision) |
 | gRPC API and OpenConfig | Upstream only | GoBGP's own API; no WireGuard or FIB additions | E7 after E3/E4 |
@@ -65,7 +65,7 @@ Baseline to beat (r2, 900k import, mean of 3, upstream): 193.8 mallocs/route, 8.
 | E1-2 | **Partly done** (IPv4 prefix slab; IPv6 and per-attribute allocations remain). `sync.Pool` for UPDATE **decode** scratch (`BGPUpdate.DecodeFromBytes`, `parseBody`) with safe release rules (nothing may alias a pooled buffer after release) | Same as E1-1, plus a test that fails if a pooled buffer is retained | E1-1 |
 | E1-3 | Table layer allocations: lazy `NewBitmap`, avoid `Path.Clone` for read-only use, `clonePathList`, `dstsToPaths` | Profile diff shows these frames drop; tests pass | A-1 |
 | E1-4 | `notifyBestWatcher`: skip building events when there are no watchers | No allocations from it with zero watchers; tests pass | none |
-| E1-5 | `GOGC` / `GOMEMLIMIT` experiments on the 900k run (no code change) | Table of settings vs CPU, RSS, converge time; recommended default documented | A-1 |
+| E1-5 | **Done.** `GOGC` / `GOMEMLIMIT` experiments on the 900k run (no code change) | Table of settings vs CPU, RSS, converge time; recommended default documented | A-1 |
 | E1-6 | Zero-copy path for `WatchEvent()` for local consumers (tracker item). **`proto/api/gobgp.proto` first**, regenerate stubs, then code | Local in-process watcher receives events without protobuf marshalling; benchmark shows lower cost; gRPC watchers unchanged. Reused by E4 (kernel sync) | none |
 | E1-7 | Peer FSM scaling: decouple the central loop so sessions advance in parallel (tracker item). Design doc first | Design doc reviewed; then implementation behind a flag; `-race` clean; lab test with many peers shows scaling | E1-1..E1-4, A-2 |
 | E1-8 | Many-peer scale test: N peers (e.g. 100 and 1000) using lightweight injectors | Result table in `lab/results/` | E6-1 |
@@ -77,6 +77,7 @@ Baseline to beat (r2, 900k import, mean of 3, upstream): 193.8 mallocs/route, 8.
 | E2-1 | `cmd/veloced` skeleton: `server.NewBgpServer`, `StartBgp`, signal handling, structured logging | Binary starts and serves the existing gRPC API | A-3 |
 | E2-2 | Config schema (TOML/YAML) for global BGP, neighbors, WireGuard interfaces, kernel sync, AWS. New fields go into `proto/api/gobgp.proto` first (CLAUDE.md rule 4), then regenerate | Config file loads and validates; invalid files give clear errors | A-4 |
 | E2-3 | Lifecycle: ordered start (WG up, BGP up, FIB sync) and ordered stop (withdraw routes, remove kernel routes, close tunnels); hot reload on SIGHUP | Integration test starts, reloads and stops cleanly with no leftover interfaces or routes | E3-1, E4-1 |
+| E2-5 | Set the Go GC defaults at startup (`debug.SetGCPercent(200)` and `debug.SetMemoryLimit` from the cgroup or instance memory, about 75-80%), overridable by `GOGC`/`GOMEMLIMIT` | Starts with the E1-5 recommended settings; env vars still win; a test checks the limit is derived from the container memory | E2-1, E1-5 |
 | E2-4 | Static build (`CGO_ENABLED=0`), size and startup check | `veloced` runs on a minimal image with no libc | E2-1 |
 
 ## E3. WireGuard engine (P1)

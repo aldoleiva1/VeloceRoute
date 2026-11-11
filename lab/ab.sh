@@ -2,6 +2,7 @@
 # A/B load test with fresh daemons per run.
 # Usage: ./ab.sh <label> <path-to-linux-gobgpd> [N]
 # Restarts gobgpd on r1-r3 with the given binary, waits for sessions, runs baseline.sh.
+# GOBGPD_ENV (for example "GOGC=200 GOMEMLIMIT=2GiB") is set in the environment of every gobgpd.
 set -e
 LABEL=$1; BIN=$2; N=${3:-900000}
 [ -f "$BIN" ] || { echo "no such binary: $BIN"; exit 1; }
@@ -23,7 +24,7 @@ for r in r1 r2 r3; do
 done
 for r in r1 r2 r3; do
   docker cp "$BIN" clab-gobgp3-$r:/usr/local/bin/gobgpd
-  docker exec -d clab-gobgp3-$r sh -c 'gobgpd -f /etc/gobgp.toml --api-hosts 0.0.0.0:50051 --pprof-host 0.0.0.0:6060 > /var/log/gobgpd.log 2>&1'
+  docker exec -d clab-gobgp3-$r sh -c "$GOBGPD_ENV gobgpd -f /etc/gobgp.toml --api-hosts 0.0.0.0:50051 --pprof-host 0.0.0.0:6060 > /var/log/gobgpd.log 2>&1"
 done
 for i in $(seq 1 60); do
   e=$(docker exec clab-gobgp3-r2 gobgp neighbor 2>/dev/null | grep -c Establ || true)

@@ -19,6 +19,8 @@ def run(path):
         'converge s': float(re.search(r'converged_r2_r3_seconds=([\d.]+)', t).group(1)),
         'RSS MB': a['process_resident_memory_bytes'] / 1e6,
     }
+    if 'go_memstats_sys_bytes' in a:
+        res['Go sys MB'] = a['go_memstats_sys_bytes'] / 1e6
     if mu:
         res['routes/UPDATE'] = N / float(mu.group(1))
     return res

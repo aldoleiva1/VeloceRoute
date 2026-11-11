@@ -26,6 +26,8 @@ All performance work; details, code walk-through and verification are in [docs/v
 
 On a feed where about 37 prefixes share each UPDATE (r2, 900k routes, n=3 each), all changes together vs upstream: 32% fewer mallocs per route, 29% less CPU, 22% faster convergence. Details in [docs/veloceroute/performance.md](docs/veloceroute/performance.md).
 
+Runtime tuning (no code change): `GOGC=200` plus a `GOMEMLIMIT` cut CPU a further 18% during the same import for about 25% more memory; see the GOGC section of that document.
+
 ## Where the work is tracked
 
 - **[ROADMAP.md](ROADMAP.md)** is the task list for getting to a finished product: every task has an ID, dependencies and a "done when" check. It starts with a progress table showing what is done, in progress and not started.

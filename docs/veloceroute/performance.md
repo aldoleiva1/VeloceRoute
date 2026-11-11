@@ -73,6 +73,60 @@ Reading it:
 - Per-route cost is lower with shared attributes than with one prefix per UPDATE
   (66 vs 140 mallocs), because attribute work is amortized over about 37 prefixes.
 
+## GOGC and GOMEMLIMIT experiments (E1-5)
+
+No code change: the same build (all changes above) was run under different Go
+runtime settings, passed to every gobgpd with `GOBGPD_ENV`. Feed: 900k routes,
+`-share 40`. r2, mean of 3 per setting, interleaved
+(`lab/results/gc*-run*.txt`, `lab/results/variance-summary-gc.txt`).
+
+| setting | GC cycles | GC pause | CPU (s) | converge (s) | RSS (MB) |
+|---|---|---|---|---|---|
+| default (`GOGC=100`) | 24.7 | 36 ms | 15.3 | 7.5 | 1146 |
+| `GOGC=200` | 12.0 | 16 ms | 12.6 (-18%) | 7.1 (-5%) | 1438 (+25%) |
+| `GOGC=400` | 7.0 | 11 ms | 11.2 (-27%) | 7.4 (-1%) | 1632 (+42%) |
+| `GOGC=off GOMEMLIMIT=2GiB` | 1.0 | 2 ms | 12.5 (-18%) | **8.8 (+17%)** | 2069 (+81%) |
+| `GOGC=200 GOMEMLIMIT=1500MiB` | 12.0 | 18 ms | 13.0 (-15%) | 7.4 (-1%) | 1366 (+19%) |
+
+Allocation counts per route are identical in every setting (66.4), as they should be:
+these settings change how often the collector runs, not how much the code allocates.
+
+What it shows:
+
+- **Fewer GC cycles save CPU, with diminishing returns.** Doubling the GC target
+  (`GOGC=200`) halves the cycles and saves 18% CPU for 25% more memory. Going to 400
+  saves a further 9 points of CPU for another 17 points of memory and no better
+  convergence time.
+- **Turning GC off is worse.** With the collector nearly idle the heap grows to the
+  2 GiB limit, and convergence got slower (8.8 s vs 7.5 s). Memory growth has its own
+  cost (fresh pages from the OS), so "no GC" is not the fastest setting.
+- **A memory limit works as a cap.** `GOGC=200` with `GOMEMLIMIT=1500MiB` stayed
+  at 1366 MB, below the 1438 MB that `GOGC=200` alone used, for a small CPU cost.
+  The limit is soft: Go collects more often as it approaches it.
+
+**Recommendation** for a box with enough memory (the lab has no per-container limit):
+`GOGC=200`, plus `GOMEMLIMIT` at about 75-80% of the memory available to the process
+so a large table cannot push the host into swap or the OOM killer. Expect about 25%
+more memory for 18% less CPU during a full-table import. Choose `GOGC=100` on small
+instances. Not recommended: `GOGC=off`. These numbers are for one 900k-route import
+into one router; steady-state memory under churn, IPv6 and many peers were not measured.
+`veloced` (E2) should set these defaults itself from the cgroup/instance memory;
+until then set them in the environment:
+
+```bash
+# on a Linux router where gobgpd is installed on the PATH
+GOGC=200 GOMEMLIMIT=6GiB gobgpd -f /etc/gobgp.toml
+
+# from a repo checkout after `go build -o bin/gobgpd ./cmd/gobgpd`
+GOGC=200 GOMEMLIMIT=6GiB ./bin/gobgpd -f <your-config>.toml
+
+# in the lab, for every router (run from lab/)
+GOBGPD_ENV="GOGC=200 GOMEMLIMIT=6GiB" ./ab.sh my-run gobgpd-decode
+```
+
+`gobgpd` listens on TCP 179, which needs root or `CAP_NET_BIND_SERVICE`, and the lab
+configs use the lab's addresses, so they only establish sessions inside the lab.
+
 ## 1. Per-UPDATE config copy (`pkg/server/peer.go`)
 
 **What upstream did.** `handleUpdate` called `pConf.ReadCopy()` for every UPDATE
@@ -270,7 +324,7 @@ Tracked in [`ROADMAP.md`](../../ROADMAP.md):
   attribute-presence map are untouched (24 allocations per UPDATE remain). E1-2.
 - Remaining 10 encode allocations: the per-UPDATE attribute-presence map, the
   options slice and small per-attribute buffers.
-- Table-layer allocations (E1-3), `notifyBestWatcher` with no watchers (E1-4),
-  `GOGC`/`GOMEMLIMIT` experiments (E1-5).
+- Table-layer allocations (E1-3) and `notifyBestWatcher` with no watchers (E1-4).
+- `veloced` choosing `GOGC`/`GOMEMLIMIT` defaults from the instance memory (E2).
 - Zero-copy `WatchEvent()` for local consumers, proto first (E1-6).
 - Decoupling the Peer FSM loop (E1-7), the riskiest item, last.
