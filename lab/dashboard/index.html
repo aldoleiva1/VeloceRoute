@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GoBGP Lab Dashboard</title>
+<style>
+:root{
+  --bg:#f6f7f9; --card:#fff; --ink:#14181f; --muted:#5d6675; --line:#e3e6eb; --grid:#eceff3;
+  --ok:#15803d; --bad:#b91c1c; --warn:#b45309; --accent:#2563eb;
+  --c1:#2563eb; --c2:#d97706; --c3:#0d9488;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#0e1116; --card:#171b22; --ink:#e8ebf0; --muted:#98a2b3; --line:#262c36; --grid:#1f2530;
+    --ok:#4ade80; --bad:#f87171; --warn:#fbbf24; --accent:#60a5fa;
+    --c1:#60a5fa; --c2:#fbbf24; --c3:#2dd4bf;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0e1116; --card:#171b22; --ink:#e8ebf0; --muted:#98a2b3; --line:#262c36; --grid:#1f2530;
+  --ok:#4ade80; --bad:#f87171; --warn:#fbbf24; --accent:#60a5fa;
+  --c1:#60a5fa; --c2:#fbbf24; --c3:#2dd4bf;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:1280px;margin:0 auto;padding:16px}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:16px}
+h1{font-size:20px;margin:0}
+h1 small{color:var(--muted);font-weight:400;font-size:13px;margin-left:8px}
+.controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.controls input{width:110px;padding:7px 9px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink)}
+button{padding:7px 12px;border-radius:6px;border:1px solid var(--line);background:var(--card);color:var(--ink);cursor:pointer;font:inherit}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button:disabled{opacity:.5;cursor:not-allowed}
+#job{color:var(--muted);font-size:13px;max-width:420px}
+.topo{display:flex;align-items:center;justify-content:center;gap:0;margin:8px 0 18px;flex-wrap:wrap}
+.node{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 18px;text-align:center;min-width:130px}
+.node b{display:block;font-size:16px}
+.node span{color:var(--muted);font-size:12px}
+.node.down{border-color:var(--bad)}
+.link{width:70px;height:3px;background:var(--line);position:relative}
+.link.up{background:var(--ok)}
+.link.down{background:var(--bad)}
+.grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
+.card h2{font-size:15px;margin:0 0 10px;display:flex;justify-content:space-between;align-items:center}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;background:var(--bad)}
+.dot.up{background:var(--ok)}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px}
+.stat{min-width:0}
+.stat .v{font-size:19px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap}
+.stat .l{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+table{width:100%;border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums}
+th,td{text-align:right;padding:4px 6px;border-top:1px solid var(--line)}
+th:first-child,td:first-child{text-align:left}
+th{color:var(--muted);font-weight:500;border-top:none}
+.est{color:var(--ok)} .notest{color:var(--bad)}
+h3{margin:22px 0 10px;font-size:15px}
+.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:14px}
+.chart h2{margin-bottom:4px}
+canvas{width:100%;height:190px;display:block}
+.legend{display:flex;gap:14px;font-size:12px;color:var(--muted);margin-top:6px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+.foot{color:var(--muted);font-size:12px;margin-top:18px}
+@media(max-width:480px){.stats{grid-template-columns:repeat(2,1fr)}.grid3,.charts{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>GoBGP Lab <small>3-router test bed · live from gobgpd metrics</small></h1>
+    <div class="controls">
+      <label for="n" style="color:var(--muted)">Prefixes</label>
+      <input id="n" type="number" min="1" max="2000000" value="900000">
+      <button class="primary" id="inject">Inject feed on r1</button>
+      <button id="withdraw">Withdraw</button>
+      <button id="theme" title="Toggle theme">Theme</button>
+    </div>
+  </header>
+  <div id="job"></div>
+
+  <div class="topo" id="topo"></div>
+  <div class="grid3" id="cards"></div>
+
+  <h3>Live charts (last 5 minutes)</h3>
+  <div class="charts" id="charts"></div>
+  <div class="foot">Allocation and GC series come from each daemon's Go runtime metrics. Use them to compare before and after changes such as sync.Pool in the attribute serialization path. r2 is the transit router and the main device under test.</div>
+</div>
+
+<script>
+const COLORS = ['--c1','--c2','--c3'];
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const fmtInt = v => Math.round(v).toLocaleString();
+const fmtBytes = v => v>=1e9 ? (v/1e9).toFixed(2)+' GB' : v>=1e6 ? (v/1e6).toFixed(0)+' MB' : (v/1e3).toFixed(0)+' KB';
+const fmtRate = v => v>=1e6 ? (v/1e6).toFixed(2)+'M' : v>=1e3 ? (v/1e3).toFixed(1)+'k' : v.toFixed(0);
+const STATE = {1:'Idle',2:'Connect',3:'Active',4:'OpenSent',5:'OpenConfirm',6:'Established'};
+
+const CHARTS = [
+  {id:'accepted', title:'Routes accepted (total across peers)', get:s=>s.accepted, fmt:fmtRate},
+  {id:'updps',    title:'UPDATE messages received / s',          get:s=>s.updatesPS, fmt:fmtRate},
+  {id:'mallocs',  title:'Heap allocations / s',                  get:s=>s.mallocsPS, fmt:fmtRate},
+  {id:'allocmb',  title:'Allocation rate (MB/s)',                get:s=>s.allocMBPS, fmt:v=>v.toFixed(0)},
+  {id:'heap',     title:'Heap in use',                           get:s=>s.heapInuse, fmt:fmtBytes},
+  {id:'cpu',      title:'CPU % (100 = one core)',                get:s=>s.cpuPct, fmt:v=>v.toFixed(0)+'%'},
+  {id:'gcps',     title:'GC cycles / s',                         get:s=>s.gcPS, fmt:v=>v.toFixed(1)},
+];
+
+function build(state){
+  const topo = document.getElementById('topo');
+  topo.innerHTML = state.routers.map((r,i)=>
+    (i? `<div class="link" id="link${i}"></div>`:'') +
+    `<div class="node" id="node-${r.name}"><b>${r.name}</b><span id="nodesub-${r.name}"></span></div>`).join('');
+  document.getElementById('cards').innerHTML = state.routers.map(r=>`
+    <div class="card" id="card-${r.name}">
+      <h2><span><span class="dot" id="dot-${r.name}"></span>${r.name}</span><span style="color:var(--muted);font-weight:400;font-size:12px">${r.addr}</span></h2>
+      <div class="stats" id="stats-${r.name}"></div>
+      <table><thead><tr><th>Peer</th><th>AS</th><th>State</th><th>Recv</th><th>Adv</th><th>Q</th></tr></thead><tbody id="peers-${r.name}"></tbody></table>
+    </div>`).join('');
+  document.getElementById('charts').innerHTML = CHARTS.map(c=>`
+    <div class="card chart"><h2>${c.title}</h2><canvas id="cv-${c.id}"></canvas><div class="legend" id="lg-${c.id}"></div></div>`).join('');
+  CHARTS.forEach(c=>{
+    document.getElementById('lg-'+c.id).innerHTML = state.routers.map((r,i)=>`<span><i style="background:var(${COLORS[i%3]})"></i>${r.name}</span>`).join('');
+  });
+}
+
+function stat(l,v){return `<div class="stat"><div class="v">${v}</div><div class="l">${l}</div></div>`}
+
+function update(state){
+  state.routers.forEach((r,i)=>{
+    const L=r.latest||{};
+    document.getElementById('dot-'+r.name).className='dot'+(r.up?' up':'');
+    document.getElementById('node-'+r.name).className='node'+(r.up?'':' down');
+    const est=(r.peers||[]).filter(p=>p.state===6).length;
+    document.getElementById('nodesub-'+r.name).textContent = r.up ? `${est}/${(r.peers||[]).length} sessions · ${fmtInt(L.accepted||0)} routes` : 'unreachable';
+    document.getElementById('stats-'+r.name).innerHTML =
+      stat('Routes accepted', fmtInt(L.accepted||0)) +
+      stat('Resident mem', fmtBytes(L.rss||0)) +
+      stat('Heap in use', fmtBytes(L.heapInuse||0)) +
+      stat('CPU', (L.cpuPct||0).toFixed(0)+'%') +
+      stat('Allocs / s', fmtRate(L.mallocsPS||0)) +
+      stat('GC pause total', ((L.gcPauseSum||0)*1000).toFixed(0)+' ms');
+    document.getElementById('peers-'+r.name).innerHTML = (r.peers||[]).map(p=>
+      `<tr><td>${p.addr}</td><td>${p.asn||''}</td><td class="${p.state===6?'est':'notest'}">${STATE[p.state]||'?'}</td><td>${fmtInt(p.received)}</td><td>${fmtInt(p.advertised)}</td><td>${p.outQueue}</td></tr>`).join('')
+      || `<tr><td colspan="6" style="color:var(--muted)">${r.err||'no peers'}</td></tr>`;
+  });
+  for(let i=1;i<state.routers.length;i++){
+    const a=state.routers[i-1],b=state.routers[i];
+    const ok=a.up&&b.up&&(a.peers||[]).some(p=>p.state===6)&&(b.peers||[]).some(p=>p.state===6);
+    const el=document.getElementById('link'+i); if(el) el.className='link '+(ok?'up':'down');
+  }
+  CHARTS.forEach(c=>draw(c,state));
+  const j=state.job, jb=document.getElementById('job');
+  const busy=j&&j.running;
+  jb.textContent = busy ? `Running: ${j.action} ${fmtInt(j.N)} prefixes…` : (j&&j.output ? `Last job: ${j.output}` : '');
+  document.getElementById('inject').disabled=busy; document.getElementById('withdraw').disabled=busy;
+}
+
+function draw(c,state){
+  const cv=document.getElementById('cv-'+c.id); if(!cv) return;
+  const dpr=window.devicePixelRatio||1, W=cv.clientWidth, H=cv.clientHeight;
+  if(cv.width!==W*dpr||cv.height!==H*dpr){cv.width=W*dpr;cv.height=H*dpr}
+  const g=cv.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,W,H);
+  const series=state.routers.map(r=>(r.history||[]).map(c.get));
+  const max=Math.max(1e-9,...series.flat())*1.1;
+  const padL=52,padB=18,padT=6,padR=6, w=W-padL-padR, h=H-padT-padB;
+  g.font='11px system-ui'; g.fillStyle=css('--muted'); g.strokeStyle=css('--grid'); g.lineWidth=1;
+  for(let k=0;k<=4;k++){
+    const y=padT+h-h*k/4; g.beginPath(); g.moveTo(padL,y); g.lineTo(W-padR,y); g.stroke();
+    g.textAlign='right'; g.fillText(c.fmt(max*k/4),padL-6,y+4);
+  }
+  g.textAlign='left'; g.fillText('-5m',padL,H-4); g.textAlign='right'; g.fillText('now',W-padR,H-4);
+  series.forEach((d,i)=>{
+    if(!d.length) return;
+    g.strokeStyle=css(COLORS[i%3]); g.lineWidth=2; g.beginPath();
+    d.forEach((v,k)=>{
+      const x=padL+w*(300-d.length+k)/299, y=padT+h-h*v/max;
+      k?g.lineTo(x,y):g.moveTo(x,y);
+    });
+    g.stroke();
+  });
+}
+
+let built=false, last=null;
+async function tick(){
+  try{
+    const s=await (await fetch('/api/state')).json();
+    if(!built){build(s);built=true}
+    last=s; update(s);
+  }catch(e){ document.getElementById('job').textContent='Dashboard backend unreachable: '+e; }
+}
+async function feed(action){
+  const n=document.getElementById('n').value;
+  const r=await fetch(`/api/feed?action=${action}&n=${n}`,{method:'POST'});
+  if(!r.ok) document.getElementById('job').textContent=await r.text();
+  tick();
+}
+document.getElementById('inject').onclick=()=>feed('inject');
+document.getElementById('withdraw').onclick=()=>feed('withdraw');
+document.getElementById('theme').onclick=()=>{
+  const d=document.documentElement, dark=(d.dataset.theme||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))==='dark';
+  d.dataset.theme=dark?'light':'dark'; if(last) update(last);
+};
+addEventListener('resize',()=>last&&update(last));
+tick(); setInterval(tick,1000);
+</script>
+</body>
+</html>

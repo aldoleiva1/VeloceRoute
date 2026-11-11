@@ -1,0 +1,36 @@
+name: gobgp3
+mgmt:
+  network: gobgp3-mgmt
+  ipv4-subnet: 10.250.0.0/24
+topology:
+  nodes:
+    r1:
+      kind: linux
+      mgmt-ipv4: 10.250.0.11
+      image: gobgp-lab:local
+      binds: [configs/r1.toml:/etc/gobgp.toml]
+      exec:
+        - ip addr add 10.0.12.1/30 dev eth1
+        - ip addr add 192.0.2.1/32 dev lo
+        - sh -c 'gobgpd -f /etc/gobgp.toml --api-hosts 0.0.0.0:50051 --pprof-host 0.0.0.0:6060 > /var/log/gobgpd.log 2>&1 &'
+    r2:
+      kind: linux
+      mgmt-ipv4: 10.250.0.12
+      image: gobgp-lab:local
+      binds: [configs/r2.toml:/etc/gobgp.toml]
+      exec:
+        - ip addr add 10.0.12.2/30 dev eth1
+        - ip addr add 10.0.23.1/30 dev eth2
+        - sh -c 'gobgpd -f /etc/gobgp.toml --api-hosts 0.0.0.0:50051 --pprof-host 0.0.0.0:6060 > /var/log/gobgpd.log 2>&1 &'
+    r3:
+      kind: linux
+      mgmt-ipv4: 10.250.0.13
+      image: gobgp-lab:local
+      binds: [configs/r3.toml:/etc/gobgp.toml]
+      exec:
+        - ip addr add 10.0.23.2/30 dev eth1
+        - ip addr add 192.0.2.1/32 dev lo
+        - sh -c 'gobgpd -f /etc/gobgp.toml --api-hosts 0.0.0.0:50051 --pprof-host 0.0.0.0:6060 > /var/log/gobgpd.log 2>&1 &'
+  links:
+    - endpoints: ["r1:eth1", "r2:eth1"]
+    - endpoints: ["r2:eth2", "r3:eth1"]

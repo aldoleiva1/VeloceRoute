@@ -1,0 +1,5 @@
+FROM alpine:3.20
+COPY dashboard-linux /usr/local/bin/dashboard
+COPY feedgen-linux /usr/local/bin/feedgen
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/dashboard"]

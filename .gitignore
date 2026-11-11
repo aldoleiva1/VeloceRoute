@@ -35,4 +35,12 @@ test/scenario_test/nosetest*.xml
 
 #
 .claude
-CLAUDE.md
+
+# VeloceRoute lab build outputs
+/bin/
+/lab/gobgpd
+/lab/gobgp
+/lab/feedgen-linux
+/lab/dashboard-linux
+/lab/clab-*/
+/lab/results/smoke-*.txt

@@ -1,0 +1,11 @@
+[global.config]
+  as = 65003
+  router-id = "3.3.3.3"
+[global.use-multiple-paths.config]
+  enabled = true
+[[neighbors]]
+  [neighbors.config]
+    neighbor-address = "10.0.23.1"
+    peer-as = 65002
+  [neighbors.timers.config]
+    connect-retry = 5
