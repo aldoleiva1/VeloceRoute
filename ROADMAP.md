@@ -16,7 +16,7 @@ Status of the product features and the task areas. A task is **done** only when 
 | A-1 variance runs | Done | 3x3 upstream vs branch in `lab/results/` | none |
 | E1 performance | In progress | Server fixes; encode path (allocations 26 to 10 per UPDATE); decode slab for IPv4 prefixes (40-prefix UPDATE 69 to 24 allocs); table layer (mallocs/route 66.4 to 50.4, CPU -26% on the realistic feed). See `docs/veloceroute/performance.md` | rest of E1-3 (`getOrCreateDest` key, `UpdatePathAttrs`, packer); then E1-6 and E1-7 |
 | E1-1 encode `sync.Pool` | Mostly done | Append writer, exact buffers, pooled AS-path scratch. `NewBGPUpdateMessage` and the attribute-presence map are untouched | finish remaining 10 allocations |
-| Single static binary (`veloced`, E2) | Not started | none | E2-1 (needs A-4 decision) |
+| Single static binary (`veloced`, E2) | Started | E2-1 skeleton: embeds GoBGP and its gRPC API, ordered start/stop, static build runs in the Alpine lab image. See `docs/veloceroute/veloced.md` | E2-2 config schema (needs A-4 decision), then E3-1 WireGuard stage |
 | gRPC API and OpenConfig | Upstream only | GoBGP's own API; no WireGuard or FIB additions | E7 after E3/E4 |
 | Linux Netlink kernel table sync (E4) | Not started | none (only a Zebra client exists) | E4-1 |
 | WireGuard engine (E3) | Not started | none | E3-1 |
@@ -74,7 +74,7 @@ Baseline to beat (r2, 900k import, mean of 3, upstream): 193.8 mallocs/route, 8.
 
 | ID | Task | Done when | deps |
 |---|---|---|---|
-| E2-1 | `cmd/veloced` skeleton: `server.NewBgpServer`, `StartBgp`, signal handling, structured logging | Binary starts and serves the existing gRPC API | A-3 |
+| E2-1 | **Done.** `cmd/veloced` skeleton: `server.NewBgpServer`, `StartBgp`, signal handling, structured logging | Binary starts and serves the existing gRPC API | A-3 |
 | E2-2 | Config schema (TOML/YAML) for global BGP, neighbors, WireGuard interfaces, kernel sync, AWS. New fields go into `proto/api/gobgp.proto` first (CLAUDE.md rule 4), then regenerate | Config file loads and validates; invalid files give clear errors | A-4 |
 | E2-3 | Lifecycle: ordered start (WG up, BGP up, FIB sync) and ordered stop (withdraw routes, remove kernel routes, close tunnels); hot reload on SIGHUP | Integration test starts, reloads and stops cleanly with no leftover interfaces or routes | E3-1, E4-1 |
 | E2-5 | Set the Go GC defaults at startup (`debug.SetGCPercent(200)` and `debug.SetMemoryLimit` from the cgroup or instance memory, about 75-80%), overridable by `GOGC`/`GOMEMLIMIT` | Starts with the E1-5 recommended settings; env vars still win; a test checks the limit is derived from the container memory | E2-1, E1-5 |
