@@ -1,73 +1,23 @@
-# GoBGP: BGP implementation in Go
+# VeloceRoute
+VeloceRoute is a lightweight software router for AWS VPC environments. It embeds a GoBGP control plane and WireGuard engine into a unified Go runtime for dynamic routing over secure tunnels.
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/osrg/gobgp)](https://goreportcard.com/report/github.com/osrg/gobgp)
-[![Tests](https://github.com/osrg/gobgp/actions/workflows/ci.yml/badge.svg)](https://github.com/osrg/gobgp/actions/workflows/ci.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/osrg/gobgp/v4.svg)](https://pkg.go.dev/github.com/osrg/gobgp/v4)
-[![Releases](https://img.shields.io/github/release/osrg/gobgp/all.svg?style=flat-square)](https://github.com/osrg/gobgp/releases)
-[![LICENSE](https://img.shields.io/github/license/osrg/gobgp.svg?style=flat-square)](https://github.com/osrg/gobgp/blob/master/LICENSE)
+Features:
+- Single static binary
+- gRPC API & OpenConfig support
+- Seamless Amazon VPC Route Server peering
+- Linux Netlink kernel table sync
 
-GoBGP is an open source Border Gateway Protocol (BGP) implementation designed from scratch for
-modern environment and implemented in a modern programming language,
-[the Go Programming Language](http://golang.org/).
+## Status
 
-----
+Early stage. The repository starts from upstream [osrg/gobgp](https://github.com/osrg/gobgp) v4.11.0 (commit `f7daa917`, remote `upstream`) and is being tuned for allocation and GC behavior under full-table imports before the new features are added. The original GoBGP README is kept in [README-GoBGP.md](README-GoBGP.md).
 
-## Install
+Changes on top of upstream so far:
+- `pkg/server/peer.go`: removed a per-UPDATE peer-config copy and made debug-log arguments lazy. About 36% fewer bytes allocated per route and 33% fewer GC cycles on a transit router importing 900k routes.
 
-Try [a binary release](https://github.com/osrg/gobgp/releases/latest).
+## Test bed
 
-## Documentation
+[`lab/`](lab/README.md) holds a containerlab three-router topology (r1 - r2 - r3, eBGP with ECMP), a synthetic full-feed injector, a live metrics dashboard, and the profiling results in [`lab/results/`](lab/results/PROFILING-sync-pool.md).
 
-### Using GoBGP
+## License
 
-- [Getting Started](docs/sources/getting-started.md)
-- CLI
-  - [Typical operation examples](docs/sources/cli-operations.md)
-  - [Complete syntax](docs/sources/cli-command-syntax.md)
-- [Route Server](docs/sources/route-server.md)
-- [Route Reflector](docs/sources/route-reflector.md)
-- [Policy](docs/sources/policy.md)
-- Zebra Integration
-  - [FIB manipulation](docs/sources/zebra.md)
-  - [Equal Cost Multipath Routing](docs/sources/zebra-multipath.md)
-- [MRT](docs/sources/mrt.md)
-- [BMP](docs/sources/bmp.md)
-- [EVPN](docs/sources/evpn.md)
-- [Flowspec](docs/sources/flowspec.md)
-- [RPKI](docs/sources/rpki.md)
-- [Metrics](docs/sources/metrics.md)
-- [Managing GoBGP with your favorite language with gRPC](docs/sources/grpc-client.md)
-- Go Native BGP Library
-  - [Basics](docs/sources/lib.md)
-  - [BGP-LS](docs/sources/bgp-ls.md)
-  - [SR Policy](docs/sources/lib-srpolicy.md)
-- [Graceful Restart](docs/sources/graceful-restart.md)
-- [Additional Paths](docs/sources/add-paths.md)
-- [Peer Group](docs/sources/peer-group.md)
-- [Dynamic Neighbor](docs/sources/dynamic-neighbor.md)
-- [eBGP Multihop](docs/sources/ebgp-multihop.md)
-- [TTL Security](docs/sources/ttl-security.md)
-- [BFD](docs/sources/bfd.md)
-- [Confederation](docs/sources/bgp-confederation.md)
-- Data Center Networking
-  - [Unnumbered BGP](docs/sources/unnumbered-bgp.md)
-- [Sentry](docs/sources/sentry.md)
-
-### Externals
-
-- [Tutorial: Using GoBGP as an IXP connecting router](http://www.slideshare.net/shusugimoto1986/tutorial-using-gobgp-as-an-ixp-connecting-router)
-- [GoBGP.nix: A NixOS module for GoBGP. Containing a working FRR implementation and a rich set of Options](https://github.com/wavelens/gobgp.nix)
-
-## Community, discussion and support
-
-We have the [Slack](https://join.slack.com/t/gobgp/shared_invite/zt-g9il5j8i-3gZwnXArK0O9Mnn4Yu~IrQ) for questions, discussion, suggestions, etc.
-
-You have code or documentation for GoBGP? Awesome! Send a pull
-request. No CLA, board members, governance, or other mess. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for info on
-code contributing.
-
-## Licensing
-
-GoBGP is licensed under the Apache License, Version 2.0. See
-[LICENSE](https://github.com/osrg/gobgp/blob/master/LICENSE) for the full
-license text.
+Apache License 2.0, inherited from GoBGP. See [LICENSE](LICENSE). The initial MIT license in this repository was replaced because it contains Apache 2.0 licensed GoBGP code.
