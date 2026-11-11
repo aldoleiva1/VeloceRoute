@@ -5,6 +5,27 @@ Goal: one static Go binary that embeds the GoBGP control plane and a WireGuard e
 
 Legend: **P0** do first, **P1** core feature, **P2** later. `deps` lists task IDs. Every task has a checkable "done when".
 
+## Progress (updated 2026-11-11)
+
+Status of the product features and the task areas. A task is **done** only when its "done when" check is met.
+
+| Area | Status | What exists | Next task |
+|---|---|---|---|
+| Lab (3 routers, feed injector, dashboard, A/B tooling) | Working | `lab/`; `ab.sh`, `run-ab2.sh`, `summarize.py` | E6-3, E6-1 |
+| Blueprint corrected to v4 and checked against AWS docs | Done (A-3) | `docs/veloceroute/blueprint.md`, compiling sample | E5-1 |
+| A-1 variance runs | Done | 3x3 upstream vs branch in `lab/results/` | none |
+| E1 performance | In progress | Server fixes; encode path (allocations 26 to 10 per UPDATE). See `docs/veloceroute/performance.md` | E1-2 decode, E1-3, E1-4, E1-5 |
+| E1-1 encode `sync.Pool` | Mostly done | Append writer, exact buffers, pooled AS-path scratch. `NewBGPUpdateMessage` and the attribute-presence map are untouched | finish remaining 10 allocations |
+| Single static binary (`veloced`, E2) | Not started | none | E2-1 (needs A-4 decision) |
+| gRPC API and OpenConfig | Upstream only | GoBGP's own API; no WireGuard or FIB additions | E7 after E3/E4 |
+| Linux Netlink kernel table sync (E4) | Not started | none (only a Zebra client exists) | E4-1 |
+| WireGuard engine (E3) | Not started | none | E3-1 |
+| Amazon VPC Route Server peering (E5) | Not started | facts verified from docs only; no AWS test yet | E5-1 |
+| CI, lint, Linux test environment (A-2, A-5, A-6) | Not started | none | A-2 |
+| Hardening and release (E8, E9) | Not started | none | after features |
+
+Decisions waiting on the owner are listed at the bottom of this file.
+
 ## 0. Blueprint review: what has to change before it is used
 
 | # | Blueprint says | Reality in this fork | Task |
@@ -26,7 +47,7 @@ AWS facts (full list with sources in `docs/veloceroute/blueprint.md`) confirmed 
 
 | ID | Task | Done when | deps |
 |---|---|---|---|
-| A-1 | Variance runs: repeat the 900k baseline 3x on upstream and 3x on our branch | `lab/results/` has 6 runs and a table with mean and spread for allocs/route, GC cycles, CPU, converge time | none |
+| A-1 | **Done.** Variance runs: repeat the 900k baseline 3x on upstream and 3x on our branch | `lab/results/` has 6 runs and a table with mean and spread for allocs/route, GC cycles, CPU, converge time | none |
 | A-2 | Linux test environment so `go test -race ./pkg/server/...` is fully green (4 tests fail on macOS: loopback alias 127.0.0.201 and TCP-AO) | Tests run in a Linux container with 0 failures; documented command in `lab/README.md` | none |
 | A-3 | ~~Correct the blueprint to v4 API~~ **Done:** `docs/veloceroute/blueprint.md` and `docs/veloceroute/blueprint/main.go` (compiles on Linux and macOS) | Done | none |
 | A-4 | Decide the Go module path (keep `osrg/gobgp/v4` internally, or rename to `github.com/aldoleiva1/VeloceRoute`) | Decision recorded; if renamed, one mechanical commit touching ~128 files, build and tests green | none |
@@ -36,11 +57,11 @@ AWS facts (full list with sources in `docs/veloceroute/blueprint.md`) confirmed 
 
 ## E1. Performance work (from CLAUDE.md tracker and profiling)
 
-Baseline to beat (r2, 900k import): 194 mallocs/route, 8.8 KB/route, 51 GC cycles, 81 s CPU, 26 s converge. After the two server fixes: 162 mallocs, 5.6 KB, 34 GC cycles, 69 s, 22 s (single run).
+Baseline to beat (r2, 900k import, mean of 3, upstream): 193.8 mallocs/route, 8.8 KB/route, 57 GC cycles, 70 s CPU, 23.5 s converge. After the two server fixes (mean of 3): 162.2 mallocs, 5.5 KB, 33.7 GC cycles, 52.8 s, 17.8 s. After the encode work (append build vs scratch build, n=4 vs 3): 154.2 to 139.9 mallocs/route. Details: `docs/veloceroute/performance.md`.
 
 | ID | Task | Done when | deps |
 |---|---|---|---|
-| E1-1 | `sync.Pool` for UPDATE **encode** buffers and temp slices: `BGPUpdate.Serialize`, `PathAttribute.Serialize`, `PathAttributeAsPath.Serialize`, `NewBGPUpdateMessage` | `go test -bench` in `pkg/packet/bgp` shows fewer allocs/op; lab run shows lower mallocs/route; tests pass with `-race` | A-1 |
+| E1-1 | **Mostly done.** `sync.Pool` for UPDATE **encode** buffers and temp slices: `BGPUpdate.Serialize`, `PathAttribute.Serialize`, `PathAttributeAsPath.Serialize`, `NewBGPUpdateMessage` | `go test -bench` in `pkg/packet/bgp` shows fewer allocs/op; lab run shows lower mallocs/route; tests pass with `-race` | A-1 |
 | E1-2 | `sync.Pool` for UPDATE **decode** scratch (`BGPUpdate.DecodeFromBytes`, `parseBody`) with safe release rules (nothing may alias a pooled buffer after release) | Same as E1-1, plus a test that fails if a pooled buffer is retained | E1-1 |
 | E1-3 | Table layer allocations: lazy `NewBitmap`, avoid `Path.Clone` for read-only use, `clonePathList`, `dstsToPaths` | Profile diff shows these frames drop; tests pass | A-1 |
 | E1-4 | `notifyBestWatcher`: skip building events when there are no watchers | No allocations from it with zero watchers; tests pass | none |

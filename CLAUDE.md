@@ -15,7 +15,7 @@
 <ul>
   <li><code>pkg/server/</code>: Core daemon event loops, Peer FSM mechanics, and RIB coordination.</li>
   <li><code>pkg/packet/bgp/</code>: Wire serialization/deserialization for BGP packets, EVPN path attributes, and communities.</li>
-  <li><code>api/</code>: Protobuf schemas (<code>gobgp.proto</code>) and generated gRPC service frameworks.</li>
+  <li><code>api/</code> and <code>proto/api/</code>: generated Go stubs (<code>api/</code>) and the Protobuf schema (<code>proto/api/gobgp.proto</code>) and generated gRPC service frameworks.</li>
   <li><code>pkg/zebra/</code>: Kernel interface bridging forwarding tables with host network stacks.</li>
 </ul>
 
@@ -24,7 +24,7 @@
   <li><b>Permissive Compliance Only:</b> Do not import GPL/LGPL code or dependencies into internal or core packages. All code additions must match Apache 2.0.</li>
   <li><b>Allocation Management:</b> Minimize internal memory allocations (<code>go test -bench=.</code>) inside critical paths in <code>pkg/packet/bgp/</code> to preserve CPU cycles during massive table updates.</li>
   <li><b>Concurrency Protocols:</b> Rely on single-writer message channels or explicit <code>sync.RWMutex</code> constructs when writing updates to the localized routing information base (RIB).</li>
-  <li><b>Protobuf Pipeline:</b> Modify <code>api/gobgp.proto</code> first when adding configuration parameters or operational endpoints, and re-generate stubs before updating code files.</li>
+  <li><b>Protobuf Pipeline:</b> Modify <code>proto/api/gobgp.proto</code> first when adding configuration parameters or operational endpoints, and re-generate stubs before updating code files.</li>
 </ol>
 
 <h2>Known &amp; Most Requested Improvements Tracker</h2>

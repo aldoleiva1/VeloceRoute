@@ -11,12 +11,38 @@ Features:
 
 Early stage. The repository starts from upstream [osrg/gobgp](https://github.com/osrg/gobgp) v4.11.0 (commit `f7daa917`, remote `upstream`) and is being tuned for allocation and GC behavior under full-table imports before the new features are added. The original GoBGP README is kept in [README-GoBGP.md](README-GoBGP.md).
 
-Changes on top of upstream so far:
-- `pkg/server/peer.go`: removed a per-UPDATE peer-config copy and made debug-log arguments lazy. About 36% fewer bytes allocated per route and 33% fewer GC cycles on a transit router importing 900k routes.
+**Not built yet:** the WireGuard engine, the Linux Netlink FIB sync, the Amazon VPC Route Server mode and the single `veloced` binary. Today the code is upstream GoBGP plus performance work. The four features above are the target, and each is tracked as tasks in [ROADMAP.md](ROADMAP.md).
+
+### Changes on top of upstream so far
+
+All performance work; details, code walk-through and verification are in [docs/veloceroute/performance.md](docs/veloceroute/performance.md).
+
+| Change | Where | Result |
+|---|---|---|
+| Removed a per-UPDATE peer-config copy; debug-log arguments built only when debug is on | `pkg/server/peer.go` | 37% fewer bytes and 41% fewer GC cycles per route on a transit router importing 900k routes (n=3) |
+| Append-style NLRI writer, one buffer per UPDATE | `pkg/packet/bgp/bgp.go` | UPDATE encode allocations 26 to 17 (1 prefix), 184 to 17 (40 prefixes) |
+| Exact-size attribute buffers, header and body in one buffer, pooled AS-path scratch | `pkg/packet/bgp/bgp.go` | Encode allocations 17 to 10; 9% fewer mallocs per route in the lab |
+
+## Where the work is tracked
+
+- **[ROADMAP.md](ROADMAP.md)** is the task list for getting to a finished product: every task has an ID, dependencies and a "done when" check. It starts with a progress table showing what is done, in progress and not started.
+- [docs/veloceroute/performance.md](docs/veloceroute/performance.md) explains the performance changes.
+- [docs/veloceroute/blueprint.md](docs/veloceroute/blueprint.md) is the corrected design for the WireGuard, Netlink and AWS Route Server work, with the AWS facts checked against AWS documentation.
+
+## Building and testing
+
+```bash
+go build -v -o bin/gobgpd ./cmd/gobgpd && go build -v -o bin/gobgp ./cmd/gobgp
+go test -v ./pkg/packet/bgp/...        # packet tests
+go test -v -race ./pkg/server/...      # server tests (4 fail on macOS, see below)
+go test -run XXX -bench 'UpdateSerialize|UpdateDecode' -benchmem ./pkg/packet/bgp/
+```
+
+Four `pkg/server` tests (`TestDisableMrt`, `TestEBGPRouteStuck`, `TestRTCDeferralTimerRaceCondition`, `TestTcpAoUpdatePeerWithClosedConnection`) fail on macOS because they need a loopback alias and TCP-AO. They fail the same way on unmodified upstream; run them on Linux.
 
 ## Test bed
 
-[`lab/`](lab/README.md) holds a containerlab three-router topology (r1 - r2 - r3, eBGP with ECMP), a synthetic full-feed injector, a live metrics dashboard, and the profiling results in [`lab/results/`](lab/results/PROFILING-sync-pool.md).
+[`lab/`](lab/README.md) holds a containerlab three-router topology (r1 - r2 - r3, eBGP with ECMP), a synthetic full-feed injector, a live metrics dashboard, A/B comparison scripts, and the profiling results in [`lab/results/`](lab/results/PROFILING-sync-pool.md).
 
 ## License
 
