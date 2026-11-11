@@ -2,6 +2,7 @@
 # A/B load test with fresh daemons per run.
 # Usage: ./ab.sh <label> <path-to-linux-gobgpd> [N]
 # Restarts gobgpd on r1-r3 with the given binary, waits for sessions, runs baseline.sh.
+# SKIP_BASELINE=1 only restarts the daemons (used by profile.sh).
 # GOBGPD_ENV (for example "GOGC=200 GOMEMLIMIT=2GiB") is set in the environment of every gobgpd.
 set -e
 LABEL=$1; BIN=$2; N=${3:-900000}
@@ -32,4 +33,5 @@ for i in $(seq 1 60); do
 done
 [ "$e" = "2" ] || { echo "sessions did not establish"; exit 1; }
 sleep 3
+[ -n "$SKIP_BASELINE" ] && { echo restarted; exit 0; }
 ./baseline.sh "$N" "$LABEL" 2>&1 | grep -E 'sent=|converged|saved'

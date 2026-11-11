@@ -81,7 +81,14 @@ func (b *Bitmap) Expand() {
 }
 
 func NewBitmap(size int) *Bitmap {
-	b := &Bitmap{}
+	b := makeBitmap(size)
+	return &b
+}
+
+// makeBitmap returns a Bitmap by value so that it can be embedded without a
+// separate heap allocation for the struct.
+func makeBitmap(size int) Bitmap {
+	var b Bitmap
 	if size != 0 {
 		b.bitmap = make([]uint64, (size+64-1)/64)
 	}
@@ -264,17 +271,6 @@ func (path *Path) IsEOR() bool {
 		return true
 	}
 	return false
-}
-
-func cloneAsPath(asAttr *bgp.PathAttributeAsPath) *bgp.PathAttributeAsPath {
-	newASparams := make([]bgp.AsPathParamInterface, len(asAttr.Value))
-	for i, param := range asAttr.Value {
-		asList := param.GetAS()
-		as := make([]uint32, len(asList))
-		copy(as, asList)
-		newASparams[i] = bgp.NewAs4PathParam(param.GetType(), as)
-	}
-	return bgp.NewPathAttributeAsPath(newASparams)
 }
 
 // learnedOnSameLink reports whether the path was learned over the same
@@ -771,13 +767,23 @@ func (path *Path) GetFullPathAttrs() []bgp.PathAttributeInterface {
 	return attrs
 }
 
+// attrTypeSet is a set of path attribute types. A type is a single octet, so a
+// fixed array on the stack replaces a heap-allocated bitmap.
+type attrTypeSet [4]uint64
+
+func (s *attrTypeSet) add(t uint)      { s[t/64] |= 1 << (t % 64) }
+func (s *attrTypeSet) has(t uint) bool { return s[t/64]&(1<<(t%64)) != 0 }
+
 func (path *Path) GetPathAttrs() []bgp.PathAttributeInterface {
-	deleted := NewBitmap(math.MaxUint8)
-	modified := make(map[uint]bgp.PathAttributeInterface)
+	var deleted attrTypeSet
+	// Only a path derived from another one (parent != nil) has modified
+	// attributes to collect, so the map is created on first use. Reading from
+	// and deleting in a nil map are valid.
+	var modified map[uint]bgp.PathAttributeInterface
 	p := path
 	for {
 		for _, t := range p.dels {
-			deleted.Flag(uint(t))
+			deleted.add(uint(t))
 		}
 		if p.parent == nil {
 			list := PathAttrs(make([]bgp.PathAttributeInterface, 0, len(p.pathAttrs)))
@@ -789,7 +795,7 @@ func (path *Path) GetPathAttrs() []bgp.PathAttributeInterface {
 				if m, ok := modified[typ]; ok {
 					list = append(list, m)
 					delete(modified, typ)
-				} else if !deleted.GetFlag(typ) {
+				} else if !deleted.has(typ) {
 					list = append(list, a)
 				}
 			}
@@ -805,7 +811,10 @@ func (path *Path) GetPathAttrs() []bgp.PathAttributeInterface {
 		} else {
 			for _, a := range p.pathAttrs {
 				typ := uint(a.GetType())
-				if _, ok := modified[typ]; !deleted.GetFlag(typ) && !ok {
+				if _, ok := modified[typ]; !deleted.has(typ) && !ok {
+					if modified == nil {
+						modified = make(map[uint]bgp.PathAttributeInterface)
+					}
 					modified[typ] = a
 				}
 			}
@@ -985,37 +994,64 @@ func (path *Path) PrependAsn(asn uint32, repeat uint8, confed bool) {
 		segType = bgp.BGP_ASPATH_ATTR_TYPE_SEQ
 	}
 
-	original := path.GetAsPath()
-
-	asns := make([]uint32, repeat)
-	for i := range asns {
-		asns[i] = asn
+	var orig []bgp.AsPathParamInterface
+	if original := path.GetAsPath(); original != nil {
+		orig = original.Value
 	}
 
-	var asPath *bgp.PathAttributeAsPath
-	if original == nil {
-		asPath = bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{})
-	} else {
-		asPath = cloneAsPath(original)
-	}
-
-	if len(asPath.Value) > 0 {
-		param := asPath.Value[0]
-		asList := param.GetAS()
-		if param.GetType() == segType {
-			// A segment holds at most 255 AS numbers. Put what does not
-			// fit into a new segment in front.
-			n := min(int(repeat), max(255-len(asList), 0))
-			asPath.Value[0] = bgp.NewAs4PathParam(segType, slices.Concat(asns[:n], asList))
-			asns = asns[n:]
+	// Build the new segment list in one pass instead of deep-copying the whole
+	// AS_PATH and then rebuilding its first segment. The result is the same:
+	//   [segment holding what did not fit] [first segment, merged if it has
+	//   the same type and room] [remaining segments].
+	// A segment holds at most 255 AS numbers; what does not fit goes into a
+	// new segment in front. Segments that are already As4PathParam are shared
+	// with the original (their contents are never modified after creation);
+	// anything else is converted to a fresh As4PathParam as before.
+	front := int(repeat)
+	var merged bgp.AsPathParamInterface
+	skip := 0
+	if len(orig) > 0 && orig[0].GetType() == segType {
+		asList := orig[0].GetAS()
+		n := min(int(repeat), max(255-len(asList), 0))
+		as := make([]uint32, n+len(asList))
+		for i := range as[:n] {
+			as[i] = asn
 		}
+		copy(as[n:], asList)
+		merged = bgp.NewAs4PathParam(segType, as)
+		front -= n
+		skip = 1
 	}
 
-	if len(asns) > 0 {
-		p := bgp.NewAs4PathParam(segType, asns)
-		asPath.Value = append([]bgp.AsPathParamInterface{p}, asPath.Value...)
+	size := len(orig) - skip
+	if merged != nil {
+		size++
 	}
-	path.setPathAttr(asPath)
+	if front > 0 {
+		size++
+	}
+	vals := make([]bgp.AsPathParamInterface, 0, size)
+	if front > 0 {
+		as := make([]uint32, front)
+		for i := range as {
+			as[i] = asn
+		}
+		vals = append(vals, bgp.NewAs4PathParam(segType, as))
+	}
+	if merged != nil {
+		vals = append(vals, merged)
+	}
+	for _, param := range orig[skip:] {
+		if a4, ok := param.(*bgp.As4PathParam); ok {
+			vals = append(vals, a4)
+			continue
+		}
+		asList := param.GetAS()
+		as := make([]uint32, len(asList))
+		copy(as, asList)
+		vals = append(vals, bgp.NewAs4PathParam(param.GetType(), as))
+	}
+	path.setPathAttr(bgp.NewPathAttributeAsPath(vals))
 }
 
 func isPrivateAS(as uint32) bool {

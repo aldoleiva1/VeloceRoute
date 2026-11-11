@@ -14,7 +14,7 @@ Status of the product features and the task areas. A task is **done** only when 
 | Lab (3 routers, feed injector, dashboard, A/B tooling) | Working | `lab/`; `ab.sh`, `run-ab2.sh`, `summarize.py` | E6-3, E6-1 |
 | Blueprint corrected to v4 and checked against AWS docs | Done (A-3) | `docs/veloceroute/blueprint.md`, compiling sample | E5-1 |
 | A-1 variance runs | Done | 3x3 upstream vs branch in `lab/results/` | none |
-| E1 performance | In progress | Server fixes; encode path (allocations 26 to 10 per UPDATE); decode slab for IPv4 prefixes (40-prefix UPDATE 69 to 24 allocs). See `docs/veloceroute/performance.md` | E1-3, E1-4 (shared-attribute `feedgen -share` and the GOGC experiments are done) |
+| E1 performance | In progress | Server fixes; encode path (allocations 26 to 10 per UPDATE); decode slab for IPv4 prefixes (40-prefix UPDATE 69 to 24 allocs); table layer (mallocs/route 66.4 to 50.4, CPU -26% on the realistic feed). See `docs/veloceroute/performance.md` | rest of E1-3 (`getOrCreateDest` key, `UpdatePathAttrs`, packer); then E1-6 and E1-7 |
 | E1-1 encode `sync.Pool` | Mostly done | Append writer, exact buffers, pooled AS-path scratch. `NewBGPUpdateMessage` and the attribute-presence map are untouched | finish remaining 10 allocations |
 | Single static binary (`veloced`, E2) | Not started | none | E2-1 (needs A-4 decision) |
 | gRPC API and OpenConfig | Upstream only | GoBGP's own API; no WireGuard or FIB additions | E7 after E3/E4 |
@@ -57,14 +57,14 @@ AWS facts (full list with sources in `docs/veloceroute/blueprint.md`) confirmed 
 
 ## E1. Performance work (from CLAUDE.md tracker and profiling)
 
-Baseline to beat (r2, 900k import, mean of 3, upstream): 193.8 mallocs/route, 8.8 KB/route, 57 GC cycles, 70 s CPU, 23.5 s converge. After the two server fixes (mean of 3): 162.2 mallocs, 5.5 KB, 33.7 GC cycles, 52.8 s, 17.8 s. After the encode work (append build vs scratch build, n=4 vs 3): 154.2 to 139.9 mallocs/route. On a realistic feed (`feedgen -share 40`, about 37 prefixes per UPDATE; mean of 3, upstream vs all changes): 97.8 to 66.4 mallocs/route, 19.9 to 14.2 s CPU, 9.4 to 7.3 s converge. Details: `docs/veloceroute/performance.md`.
+Baseline to beat (r2, 900k import, mean of 3, upstream): 193.8 mallocs/route, 8.8 KB/route, 57 GC cycles, 70 s CPU, 23.5 s converge. After the two server fixes (mean of 3): 162.2 mallocs, 5.5 KB, 33.7 GC cycles, 52.8 s, 17.8 s. After the encode work (append build vs scratch build, n=4 vs 3): 154.2 to 139.9 mallocs/route. On a realistic feed (`feedgen -share 40`, about 37 prefixes per UPDATE; mean of 3, upstream vs all changes): 97.8 to 66.4 mallocs/route, 19.9 to 14.2 s CPU, 9.4 to 7.3 s converge. After the table-layer work (previous build vs new, n=3): 66.4 to 50.4 mallocs/route, 15.5 to 11.4 s CPU, 8.0 to 6.6 s converge. Details: `docs/veloceroute/performance.md`.
 
 | ID | Task | Done when | deps |
 |---|---|---|---|
 | E1-1 | **Mostly done.** `sync.Pool` for UPDATE **encode** buffers and temp slices: `BGPUpdate.Serialize`, `PathAttribute.Serialize`, `PathAttributeAsPath.Serialize`, `NewBGPUpdateMessage` | `go test -bench` in `pkg/packet/bgp` shows fewer allocs/op; lab run shows lower mallocs/route; tests pass with `-race` | A-1 |
 | E1-2 | **Partly done** (IPv4 prefix slab; IPv6 and per-attribute allocations remain). `sync.Pool` for UPDATE **decode** scratch (`BGPUpdate.DecodeFromBytes`, `parseBody`) with safe release rules (nothing may alias a pooled buffer after release) | Same as E1-1, plus a test that fails if a pooled buffer is retained | E1-1 |
-| E1-3 | Table layer allocations: lazy `NewBitmap`, avoid `Path.Clone` for read-only use, `clonePathList`, `dstsToPaths` | Profile diff shows these frames drop; tests pass | A-1 |
-| E1-4 | `notifyBestWatcher`: skip building events when there are no watchers | No allocations from it with zero watchers; tests pass | none |
+| E1-3 | **Partly done** (bitmap, `PrependAsn`/`cloneAsPath`, `dstsToPaths`, `GetPathAttrs` speed; `Path.Clone` and `getOrCreateDest` key remain). Table layer allocations: lazy `NewBitmap`, avoid `Path.Clone` for read-only use, `clonePathList`, `dstsToPaths` | Profile diff shows these frames drop; tests pass | A-1 |
+| E1-4 | **Done.** `notifyBestWatcher`: skip building events when there are no watchers | No allocations from it with zero watchers; tests pass | none |
 | E1-5 | **Done.** `GOGC` / `GOMEMLIMIT` experiments on the 900k run (no code change) | Table of settings vs CPU, RSS, converge time; recommended default documented | A-1 |
 | E1-6 | Zero-copy path for `WatchEvent()` for local consumers (tracker item). **`proto/api/gobgp.proto` first**, regenerate stubs, then code | Local in-process watcher receives events without protobuf marshalling; benchmark shows lower cost; gRPC watchers unchanged. Reused by E4 (kernel sync) | none |
 | E1-7 | Peer FSM scaling: decouple the central loop so sessions advance in parallel (tracker item). Design doc first | Design doc reviewed; then implementation behind a flag; `-race` clean; lab test with many peers shows scaling | E1-1..E1-4, A-2 |

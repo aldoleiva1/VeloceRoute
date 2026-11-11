@@ -28,6 +28,7 @@ and re-advertise path.
 | 3 | Append-style NLRI writer, one buffer per UPDATE | `pkg/packet/bgp/bgp.go` | UPDATE encode allocations 26 to 17 (1 prefix), 184 to 17 (40 prefixes) |
 | 4 | Exact-size attribute buffers, header and body in one buffer, pooled AS-path scratch | `pkg/packet/bgp/bgp.go` | Encode allocations 17 to 10 |
 | 5 | Decode: one slab of prefix structs and one exactly-sized slice per UPDATE | `pkg/packet/bgp/bgp.go` | Decode allocations for 40 prefixes 69 to 24; no change for 1 prefix |
+| 6 | Table layer: skip the best-path event with no watchers, lazy multipath lists, one-pass `PrependAsn`, bitmap by value, stack bitset in `GetPathAttrs` | `pkg/server/server.go`, `internal/pkg/table/` | Mallocs/route -24%, CPU -26% on the realistic feed |
 
 Cumulative lab result, upstream vs changes 1 and 2 (r2, 900k routes, n=3 each,
 interleaved runs, fresh daemons per run):
@@ -126,6 +127,55 @@ GOBGPD_ENV="GOGC=200 GOMEMLIMIT=6GiB" ./ab.sh my-run gobgpd-decode
 
 `gobgpd` listens on TCP 179, which needs root or `CAP_NET_BIND_SERVICE`, and the lab
 configs use the lab's addresses, so they only establish sessions inside the lab.
+
+## 6. Table layer (E1-3, E1-4)
+
+Found by an allocation profile of r2 on the realistic feed (`lab/profile.sh`,
+`lab/results/prof/tbl-base_*`). `propagateUpdate` runs once per path, so every small
+allocation in it is paid once per route.
+
+| Change | Where | What it does |
+|---|---|---|
+| Skip the best-path event with no watchers | `notifyBestWatcher` in `pkg/server/server.go` | The function cloned every best path, built a map and an event, then handed it to zero watchers. It now returns early when `isWatched(watchEventTypeBestPath)` is false. This was the largest single site (15% of sampled allocations). Behavior with a watcher is unchanged. |
+| Optional multipath lists stay nil | `dstsToPaths` | Three of its five result slices are only filled when multiple paths are in use; they are now created on first append instead of for every call. Callers only range over them or take their length. |
+| One-pass `PrependAsn` | `internal/pkg/table/path.go` | It deep-copied the whole AS_PATH, then rebuilt its first segment, then (when the first segment had a different type) copied the list again. It now builds the final segment list once and shares the segments that are already `As4PathParam` (segment contents are never modified after creation; the segment *list* is always a fresh slice because some code replaces entries in it). Non-4-octet segments are still converted to fresh `As4PathParam`s as before. The attribute length and flags are now computed from the final path, where before they kept the pre-prepend values. |
+| Bitmap by value | `destination` | The per-destination add-path id bitmap is stored by value, saving one allocation per destination. |
+| Stack bitset in `GetPathAttrs` | `internal/pkg/table/path.go` | A fixed array on the stack replaces a heap bitmap, and the `modified` map is created only for derived paths. This makes the call about 15% faster (26 to 22 ns); it does **not** reduce allocations, because Go already kept the old bitmap on the stack. |
+
+**Verification.** `internal/pkg/table/path_alloc_test.go` keeps copies of the old
+`PrependAsn`, `cloneAsPath` and `GetPathAttrs` and compares: 3000 random AS paths
+(2- and 4-octet segments, all four segment types, full and nearly full segments,
+repeat counts that overflow 255), byte for byte on the wire plus `String()`;
+2000 random chains of derived paths for `GetPathAttrs`; and a test that the
+original path is untouched after derived paths prepend. Three deliberate bugs (wrong
+front count, ignored deletions, mutating a shared segment) were each caught. Existing
+table and server tests pass; `pkg/server` shows only the four known macOS failures.
+Five existing destination tests changed `NewBitmap(64)` to `makeBitmap(64)` for the new field type.
+
+**Result** (r2, 900k routes, `-share 40`, n=3 each, interleaved, previous build vs this one;
+`lab/results/variance-summary-table.txt`):
+
+| metric | previous build | with table-layer changes | change |
+|---|---|---|---|
+| mallocs/route | 66.4 | 50.4 | **-24%** |
+| KB/route | 2.8 | 2.3 | -18% |
+| GC cycles | 24.0 | 21.3 | -11% |
+| CPU (s) | 15.5 | 11.4 | **-26%** |
+| converge (s) | 8.0 | 6.6 | **-18%** |
+| RSS (MB) | 1095 | 1003 | -8% |
+
+CPU and convergence ranges do not overlap. Sampled allocations per import fell from
+41.8M to 27.1M (-35%). The sites gone or smaller in the new profile: `notifyBestWatcher` 6.5M to 0,
+`NewBitmap` 2.8M to 0, `cloneAsPath` 3.0M to 0, `PrependAsn` 5.3M to 3.0M, `dstsToPaths` 4.2M to 2.8M.
+There is no build per individual fix, so the gain is not split between them; the profile
+suggests the best-path event skip is the largest part.
+
+Against the upstream builds measured earlier the same day on the same feed (not interleaved with
+this batch, so indicative only): mallocs/route 97.8 to 50.4, CPU 19.9 to 11.4 s, converge 9.4 to 6.6 s.
+
+**Still allocating in the table layer** (new profile, share of sampled objects): `UpdatePathAttrs`
+18%, `TableManager.Update` 17%, the update packer 12%, `getOrCreateDest` 11% (a prefix string key
+per lookup and the destination), `PrependAsn` 11%, `dstsToPaths` 10% (best and old lists), `updateRoutes` 9%.
 
 ## 1. Per-UPDATE config copy (`pkg/server/peer.go`)
 
@@ -324,7 +374,7 @@ Tracked in [`ROADMAP.md`](../../ROADMAP.md):
   attribute-presence map are untouched (24 allocations per UPDATE remain). E1-2.
 - Remaining 10 encode allocations: the per-UPDATE attribute-presence map, the
   options slice and small per-attribute buffers.
-- Table-layer allocations (E1-3) and `notifyBestWatcher` with no watchers (E1-4).
+- Remaining table-layer sites listed under change 6 (E1-3 is partly done).
 - `veloced` choosing `GOGC`/`GOMEMLIMIT` defaults from the instance memory (E2).
 - Zero-copy `WatchEvent()` for local consumers, proto first (E1-6).
 - Decoupling the Peer FSM loop (E1-7), the riskiest item, last.

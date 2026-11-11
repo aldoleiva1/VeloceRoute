@@ -23,6 +23,7 @@ All performance work; details, code walk-through and verification are in [docs/v
 | Append-style NLRI writer, one buffer per UPDATE | `pkg/packet/bgp/bgp.go` | UPDATE encode allocations 26 to 17 (1 prefix), 184 to 17 (40 prefixes) |
 | Exact-size attribute buffers, header and body in one buffer, pooled AS-path scratch | `pkg/packet/bgp/bgp.go` | Encode allocations 17 to 10; 9% fewer mallocs per route in the lab |
 | Decode: one slab of prefix structs per UPDATE | `pkg/packet/bgp/bgp.go` | 40-prefix UPDATE decode 69 to 24 allocations |
+| Table layer: no best-path event with no watchers, one-pass AS-path prepend, fewer small allocations per route | `pkg/server/server.go`, `internal/pkg/table/` | A further 24% fewer mallocs and 26% less CPU per route on the realistic feed |
 
 On a feed where about 37 prefixes share each UPDATE (r2, 900k routes, n=3 each), all changes together vs upstream: 32% fewer mallocs per route, 29% less CPU, 22% faster convergence. Details in [docs/veloceroute/performance.md](docs/veloceroute/performance.md).
 

@@ -205,14 +205,14 @@ func NewPeerInfo(g *oc.Global, p *oc.Neighbor, AS, localAS uint32, ID, localID n
 type destination struct {
 	nlri          bgp.NLRI // not mutable
 	knownPathList []*Path
-	localIdMap    *Bitmap
+	localIdMap    Bitmap
 }
 
 func newDestination(nlri bgp.NLRI, mapSize int, known ...*Path) *destination {
 	d := &destination{
 		nlri:          nlri,
 		knownPathList: known,
-		localIdMap:    NewBitmap(mapSize),
+		localIdMap:    makeBitmap(mapSize),
 	}
 	// the id zero means id is not allocated yet.
 	if mapSize != 0 {

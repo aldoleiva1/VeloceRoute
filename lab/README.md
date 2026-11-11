@@ -38,3 +38,10 @@ By default `feedgen` gives every prefix its own AS path (one prefix per UPDATE).
     python3 summarize.py gc-default gc200 gc400
 
 `GOBGPD_ENV` (used by `ab.sh`) sets variables in the environment of every gobgpd. `summarize.py` also reports `Go sys MB` (memory the Go runtime obtained from the OS, close to peak) and `routes/UPDATE`.
+
+## Allocation profile of r2
+
+    FEEDGEN_ARGS="-share 40" ./profile.sh <label> <linux-gobgpd>
+    go tool pprof -sample_index=alloc_objects -base results/prof/<label>_before.pb.gz -top -cum results/prof/<label>_after.pb.gz
+
+`profile.sh` restarts the daemons, snapshots r2's allocation profile, runs one import, snapshots again. `SKIP_BASELINE=1 ./ab.sh ...` only restarts the daemons.

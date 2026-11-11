@@ -960,6 +960,10 @@ func (s *BgpServer) notifyBestWatcher(best []*table.Path, multipath [][]*table.P
 		// Note: If best path selection disabled, no best path to notify.
 		return
 	}
+	if !s.isWatched(watchEventTypeBestPath) {
+		// Nobody is listening: do not clone the paths or build the event.
+		return
+	}
 	m := make(map[uint32]bool)
 	clonedM := make([][]*table.Path, len(multipath))
 	for i, pathList := range multipath {
@@ -1669,9 +1673,10 @@ func (s *BgpServer) rtcVPNCandidates(peer *peer, isWithdraw bool, nlri *bgp.Rout
 func dstsToPaths(id string, as uint32, dsts []*table.Update, useMultiplePaths bool) ([]*table.Path, []*table.Path, [][]*table.Path, []*table.Path, []*table.Path) {
 	bestList := make([]*table.Path, 0, len(dsts))
 	oldList := make([]*table.Path, 0, len(dsts))
-	mpathList := make([][]*table.Path, 0, len(dsts))
-	multipathUpdate := make([]*table.Path, 0, len(dsts))
-	multipathWithdraw := make([]*table.Path, 0, len(dsts))
+	// The multipath lists stay nil unless multiple paths are in use; the
+	// callers only range over them or take their length.
+	var mpathList [][]*table.Path
+	var multipathUpdate, multipathWithdraw []*table.Path
 
 	for _, dst := range dsts {
 		best, old, mpath := dst.GetChanges(id, as, false, useMultiplePaths)

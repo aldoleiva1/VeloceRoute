@@ -758,7 +758,7 @@ func TestNHT_InvalidateNewPathWithoutMED(t *testing.T) {
 	original := NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, attrs, time.Now(), false)
 
 	// Step 2: path is added to destination (first time -- no old entry)
-	d := &destination{nlri: nlri, localIdMap: NewBitmap(64)}
+	d := &destination{nlri: nlri, localIdMap: makeBitmap(64)}
 	d.localIdMap.Flag(0)
 	update1, _ := d.Calculate(logger, original, oc.RouteSelectionOptionsConfig{})
 
@@ -795,7 +795,7 @@ func TestNHT_InvalidateExistingPathWithMED(t *testing.T) {
 
 	original := NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, attrs, time.Now(), false)
 
-	d := &destination{nlri: nlri, localIdMap: NewBitmap(64)}
+	d := &destination{nlri: nlri, localIdMap: makeBitmap(64)}
 	d.localIdMap.Flag(0)
 	d.Calculate(logger, original, oc.RouteSelectionOptionsConfig{})
 
@@ -825,7 +825,7 @@ func TestNHT_RevalidatePath(t *testing.T) {
 
 	original := NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, attrs, time.Now(), false)
 
-	d := &destination{nlri: nlri, localIdMap: NewBitmap(64)}
+	d := &destination{nlri: nlri, localIdMap: makeBitmap(64)}
 	d.localIdMap.Flag(0)
 	d.Calculate(logger, original, oc.RouteSelectionOptionsConfig{})
 
@@ -868,7 +868,7 @@ func TestNHT_NewPathWithInvalidNexthop(t *testing.T) {
 	newPath := NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, attrs, time.Now(), false)
 	newPath.IsNexthopInvalid = true
 
-	d := &destination{nlri: nlri, localIdMap: NewBitmap(64)}
+	d := &destination{nlri: nlri, localIdMap: makeBitmap(64)}
 	d.localIdMap.Flag(0)
 
 	update, _ := d.Calculate(logger, newPath, oc.RouteSelectionOptionsConfig{})
@@ -940,7 +940,7 @@ func TestGetChanges_NonKeyNlriOrNexthopOnlyChange(t *testing.T) {
 	}
 
 	p1 := newPath(netip.MustParseAddr("0.0.0.100"), netip.MustParseAddr("10.0.0.1"))
-	d := &destination{nlri: p1.GetNlri(), localIdMap: NewBitmap(64)}
+	d := &destination{nlri: p1.GetNlri(), localIdMap: makeBitmap(64)}
 	d.localIdMap.Flag(0)
 
 	u1, _ := d.Calculate(logger, p1, oc.RouteSelectionOptionsConfig{})
