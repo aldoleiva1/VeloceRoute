@@ -1548,6 +1548,20 @@ func (r *IPAddrPrefixDefault) serializePrefix() []byte {
 	return buf
 }
 
+// appendPrefix appends the significant prefix bytes to dst without allocating
+// (serializePrefix allocates the address slice and the result separately).
+// The bytes are the same as serializePrefix returns.
+func (r *IPAddrPrefixDefault) appendPrefix(dst []byte) []byte {
+	byteLen := (r.Prefix.Bits() + 7) / 8
+	addr := r.Prefix.Addr()
+	if addr.Is4() {
+		a := addr.As4()
+		return append(dst, a[:byteLen]...)
+	}
+	a := addr.As16()
+	return append(dst, a[:byteLen]...)
+}
+
 type IPAddrPrefix struct {
 	IPAddrPrefixDefault
 }
@@ -1565,6 +1579,12 @@ func (r *IPAddrPrefix) decodeFromBytes(data []byte, addrlen int, options ...*Mar
 func (r *IPAddrPrefix) Serialize(options ...*MarshallingOption) ([]byte, error) {
 	buf := []byte{uint8(r.Prefix.Bits())}
 	return append(buf, r.serializePrefix()...), nil
+}
+
+// appendNLRI appends the wire form (length octet and prefix bytes) to dst.
+// It produces the same bytes as Serialize.
+func (r *IPAddrPrefix) appendNLRI(dst []byte) []byte {
+	return r.appendPrefix(append(dst, uint8(r.Prefix.Bits())))
 }
 
 func (r *IPAddrPrefix) Len(options ...*MarshallingOption) int {
@@ -13659,12 +13679,11 @@ func (p *PathAttributeMpReachNLRI) Serialize(options ...*MarshallingOption) ([]b
 	isAddpath := IsAddPathEnabled(false, NewFamily(afi, safi), options)
 	if !onlyNexthop {
 		buf = append(buf, 0)
-		for _, prefix := range p.Value {
-			pbuf, err := prefix.toSlice(isAddpath)
-			if err != nil {
+		for i := range p.Value {
+			var err error
+			if buf, err = p.Value[i].appendTo(buf, isAddpath); err != nil {
 				return nil, err
 			}
-			buf = append(buf, pbuf...)
 		}
 	}
 	return p.PathAttribute.Serialize(buf, options...)
@@ -13828,12 +13847,11 @@ func (p *PathAttributeMpUnreachNLRI) Serialize(options ...*MarshallingOption) ([
 	buf[2] = p.SAFI
 	addpath := IsAddPathEnabled(false, NewFamily(p.AFI, p.SAFI), options)
 
-	for _, prefix := range p.Value {
-		pbuf, err := prefix.toSlice(addpath)
-		if err != nil {
+	for i := range p.Value {
+		var err error
+		if buf, err = p.Value[i].appendTo(buf, addpath); err != nil {
 			return nil, err
 		}
-		buf = append(buf, pbuf...)
 	}
 	return p.PathAttribute.Serialize(buf, options...)
 }
@@ -17403,20 +17421,27 @@ type PathNLRI struct {
 	ID   uint32
 }
 
-func (p *PathNLRI) toSlice(isAddPath bool) ([]byte, error) {
-	var buf []byte
+// nlriAppender is implemented by NLRI types that can write their wire form
+// straight into a caller-provided buffer, avoiding a temporary slice per NLRI.
+type nlriAppender interface {
+	appendNLRI(dst []byte) []byte
+}
+
+// appendTo appends the wire form of the NLRI (preceded by the path identifier
+// when add-path is on) to dst. NLRI types without nlriAppender fall back to
+// Serialize.
+func (p *PathNLRI) appendTo(dst []byte, isAddPath bool) ([]byte, error) {
 	if isAddPath {
-		var tmp [4]byte
-		binary.BigEndian.PutUint32(tmp[:], p.ID)
-		buf = append(buf, tmp[:]...)
+		dst = binary.BigEndian.AppendUint32(dst, p.ID)
+	}
+	if a, ok := p.NLRI.(nlriAppender); ok {
+		return a.appendNLRI(dst), nil
 	}
 	nbuf, err := p.NLRI.Serialize()
 	if err != nil {
 		return nil, err
 	}
-	buf = append(buf, nbuf...)
-
-	return buf, nil
+	return append(dst, nbuf...), nil
 }
 
 func (p PathNLRI) String() string {
@@ -17605,41 +17630,42 @@ func (msg *BGPUpdate) DecodeFromBytes(data []byte, options ...*MarshallingOption
 }
 
 func (msg *BGPUpdate) Serialize(options ...*MarshallingOption) ([]byte, error) {
-	wbuf := make([]byte, 2)
 	v4AddPath := IsAddPathEnabled(false, RF_IPv4_UC, options)
-	for _, w := range msg.WithdrawnRoutes {
-		onewbuf, err := w.toSlice(v4AddPath)
-		if err != nil {
+
+	// Build the whole body in one buffer: 2 octets of withdrawn length, the
+	// withdrawn routes, 2 octets of attribute length, the attributes, then
+	// the NLRI. The length fields are patched in place.
+	buf := make([]byte, 2, 4+8*(len(msg.WithdrawnRoutes)+len(msg.NLRI))+32*len(msg.PathAttributes))
+	var err error
+	for i := range msg.WithdrawnRoutes {
+		if buf, err = msg.WithdrawnRoutes[i].appendTo(buf, v4AddPath); err != nil {
 			return nil, err
 		}
-		wbuf = append(wbuf, onewbuf...)
 	}
-	msg.WithdrawnRoutesLen = uint16(len(wbuf) - 2)
-	binary.BigEndian.PutUint16(wbuf, msg.WithdrawnRoutesLen)
+	msg.WithdrawnRoutesLen = uint16(len(buf) - 2)
+	binary.BigEndian.PutUint16(buf, msg.WithdrawnRoutesLen)
 
 	attributes := getBGPUpdateAttributesFromMsg(msg)
 	o := MarshallingOption{
 		attributes: attributes,
 	}
 	options = append(options, &o)
-	pbuf := make([]byte, 2)
+	attrLenAt := len(buf)
+	buf = append(buf, 0, 0)
 	for _, p := range msg.PathAttributes {
 		onepbuf, err := p.Serialize(options...)
 		if err != nil {
 			return nil, err
 		}
-		pbuf = append(pbuf, onepbuf...)
+		buf = append(buf, onepbuf...)
 	}
-	msg.TotalPathAttributeLen = uint16(len(pbuf) - 2)
-	binary.BigEndian.PutUint16(pbuf, msg.TotalPathAttributeLen)
+	msg.TotalPathAttributeLen = uint16(len(buf) - attrLenAt - 2)
+	binary.BigEndian.PutUint16(buf[attrLenAt:], msg.TotalPathAttributeLen)
 
-	buf := append(wbuf, pbuf...)
-	for _, n := range msg.NLRI {
-		nbuf, err := n.toSlice(v4AddPath)
-		if err != nil {
+	for i := range msg.NLRI {
+		if buf, err = msg.NLRI[i].appendTo(buf, v4AddPath); err != nil {
 			return nil, err
 		}
-		buf = append(buf, nbuf...)
 	}
 
 	return buf, nil

@@ -74,3 +74,41 @@ Upstream = commit f7daa917. Branch = same plus the two `peer.go` fixes. Runs alt
 Reading: allocation counts are essentially deterministic (spread under 0.5%), so the -16% mallocs and -37% bytes per route are solid. GC cycles, CPU and convergence time are separated by the observed ranges with n=3. GC pause total and RSS are not distinguishable from noise. The earlier single-run claim that total GC pause rose (89 -> 154 ms) was noise.
 
 Process notes: a first attempt failed because killed `gobgpd` processes linger as zombies (container PID 1 is `sleep`), which the wait loop counted; `ab.sh` now ignores zombies. Partial runs from before the fix are in `results/discarded/`.
+
+
+## sync.Pool / allocation baseline for the packet layer (Apple M3 Pro, `-cpu=1`, 8 samples, upstream + peer.go fixes)
+
+Command: `go test ./pkg/packet/bgp/ -run '^$' -bench 'BenchmarkUpdate(Serialize|Decode)' -benchmem -count=8 -cpu=1`. Raw output: `results/bench-baseline-encode-decode.txt`. Allocation numbers are exact and repeatable; ns/op varies about 10% (first sample of each case is a warm-up outlier).
+
+| benchmark | median ns/op [min..max] | B/op | allocs/op |
+|---|---|---|---|
+| UpdateSerialize/nlri=1 (n=8) | 475 [468 .. 670] | 600 | 26 |
+| UpdateSerialize/nlri=40 (n=8) | 2764 [2552 .. 3001] | 2272 | 184 |
+| UpdateDecode/nlri=1 (n=8) | 592 [580 .. 666] | 664 | 24 |
+| UpdateDecode/nlri=40 (n=8) | 2016 [2007 .. 2051] | 5320 | 69 |
+
+Allocation sites (exact profile, `-memprofilerate=1`, 40-prefix UPDATE):
+
+- **Encode:** `IPAddrPrefix.Serialize` 50% of objects, `PathNLRI.toSlice` 25%, `BGPUpdate.Serialize` own appends 11%, `PathAttribute.Serialize` 5%. About 4 extra allocations per prefix (184 allocs for 40 prefixes vs 26 for 1): each prefix builds its own small byte slice, `toSlice` copies it again, then `append` grows the output buffer.
+- **Decode:** `BGPUpdate.DecodeFromBytes` is 83% of objects (about 1.4 per prefix); attribute decode is small.
+
+Implication for the plan: `sync.Pool` suits only temporary buffers whose contents are copied out before return. The per-prefix encode slices are better removed outright with an append-style serializer that writes into one pre-sized buffer. Decode objects escape into the returned message, so they cannot be pooled; batch-allocating prefix structs is the safer lever.
+
+## Step 1 of encode work: append-style NLRI writer (`pkg/packet/bgp/bgp.go`)
+
+Change: `IPAddrPrefix.appendNLRI` / `IPAddrPrefixDefault.appendPrefix` and `PathNLRI.appendTo` write each prefix straight into the output buffer; `BGPUpdate.Serialize` builds the body in one pre-sized buffer with the two length fields patched in place; the MP_REACH and MP_UNREACH serializers use the same writer. NLRI types without the fast path fall back to `Serialize`. `Serialize` output is unchanged.
+
+Correctness: `nlri_append_test.go` compares the new code byte for byte against a copy of the old implementation (every IPv4 and IPv6 prefix length, add-path on and off, labeled and VPN NLRI via the fallback, whole UPDATEs with withdrawn routes, MP_REACH and MP_UNREACH). Two deliberate bugs (length octet and attribute length off by one) were both caught by these tests. `go test ./pkg/packet/... ./internal/... ./pkg/config/... ./pkg/apiutil/...` pass; `go test -race ./pkg/server/...` shows only the same four macOS failures as untouched upstream.
+
+Benchmarks (median of 8, `-cpu=1`, raw in `results/bench-after-append-nlri.txt`):
+
+| benchmark | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| UpdateSerialize nlri=1 | 475 -> 349 (-27%) | 600 -> 472 | 26 -> 17 |
+| UpdateSerialize nlri=40 | 2764 -> 622 (-77%) | 2272 -> 968 | 184 -> 17 |
+| UpdateDecode (both) | unchanged | unchanged | unchanged |
+
+Lab, one run on r2 (n=1, indicative only): mallocs/route 162.2 -> 154.2, CPU 52.8 s -> 41.5 s, converge 17.8 s -> 15.4 s, KB/route unchanged (5.5 -> 5.4).
+Why the lab gain is smaller than the benchmark: `feedgen` gives almost every prefix its own AS path, so each UPDATE carries one prefix, and the saving is the 9 allocations of the nlri=1 case (about 8 per route observed). Real internet tables pack many prefixes behind shared attributes, so the nlri=40 style gain should show up there. Consider adding a mode to `feedgen` that shares attributes across prefixes.
+
+Remaining encode allocations (17 per UPDATE) are fixed cost: per-attribute buffers, the message header copy and the attribute list helper. Next candidates: pre-size `PathAttribute.Serialize` (2 allocs to 1), reserve header space so `BGPMessage.Serialize` does not copy the body, and pool the scratch buffers.

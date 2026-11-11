@@ -1,0 +1,38 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/osrg/gobgp/v4/pkg/packet/bgp
+cpu: Apple M3 Pro
+BenchmarkUpdateSerialize/nlri=1         	 1494211	       669.7 ns/op	     600 B/op	      26 allocs/op
+BenchmarkUpdateSerialize/nlri=1         	 2523398	       477.6 ns/op	     600 B/op	      26 allocs/op
+BenchmarkUpdateSerialize/nlri=1         	 2475363	       472.8 ns/op	     600 B/op	      26 allocs/op
+BenchmarkUpdateSerialize/nlri=1         	 2522304	       469.7 ns/op	     600 B/op	      26 allocs/op
+BenchmarkUpdateSerialize/nlri=1         	 2538621	       467.9 ns/op	     600 B/op	      26 allocs/op
+BenchmarkUpdateSerialize/nlri=1         	 2478168	       482.2 ns/op	     600 B/op	      26 allocs/op
+BenchmarkUpdateSerialize/nlri=1         	 2329604	       487.9 ns/op	     600 B/op	      26 allocs/op
+BenchmarkUpdateSerialize/nlri=1         	 2565578	       472.5 ns/op	     600 B/op	      26 allocs/op
+BenchmarkUpdateSerialize/nlri=40        	  457341	      2836 ns/op	    2272 B/op	     184 allocs/op
+BenchmarkUpdateSerialize/nlri=40        	  446420	      3001 ns/op	    2272 B/op	     184 allocs/op
+BenchmarkUpdateSerialize/nlri=40        	  458816	      2786 ns/op	    2272 B/op	     184 allocs/op
+BenchmarkUpdateSerialize/nlri=40        	  459013	      2946 ns/op	    2272 B/op	     184 allocs/op
+BenchmarkUpdateSerialize/nlri=40        	  471986	      2552 ns/op	    2272 B/op	     184 allocs/op
+BenchmarkUpdateSerialize/nlri=40        	  484440	      2742 ns/op	    2272 B/op	     184 allocs/op
+BenchmarkUpdateSerialize/nlri=40        	  470018	      2602 ns/op	    2272 B/op	     184 allocs/op
+BenchmarkUpdateSerialize/nlri=40        	  481011	      2574 ns/op	    2272 B/op	     184 allocs/op
+BenchmarkUpdateDecode/nlri=1            	 2068316	       628.4 ns/op	     664 B/op	      24 allocs/op
+BenchmarkUpdateDecode/nlri=1            	 1979664	       580.2 ns/op	     664 B/op	      24 allocs/op
+BenchmarkUpdateDecode/nlri=1            	 2065765	       590.5 ns/op	     664 B/op	      24 allocs/op
+BenchmarkUpdateDecode/nlri=1            	 2025298	       587.8 ns/op	     664 B/op	      24 allocs/op
+BenchmarkUpdateDecode/nlri=1            	 2063528	       605.3 ns/op	     664 B/op	      24 allocs/op
+BenchmarkUpdateDecode/nlri=1            	 1729096	       666.0 ns/op	     664 B/op	      24 allocs/op
+BenchmarkUpdateDecode/nlri=1            	 2014994	       593.2 ns/op	     664 B/op	      24 allocs/op
+BenchmarkUpdateDecode/nlri=1            	 2071742	       583.6 ns/op	     664 B/op	      24 allocs/op
+BenchmarkUpdateDecode/nlri=40           	  592620	      2007 ns/op	    5320 B/op	      69 allocs/op
+BenchmarkUpdateDecode/nlri=40           	  598698	      2033 ns/op	    5320 B/op	      69 allocs/op
+BenchmarkUpdateDecode/nlri=40           	  598147	      2013 ns/op	    5320 B/op	      69 allocs/op
+BenchmarkUpdateDecode/nlri=40           	  603882	      2012 ns/op	    5320 B/op	      69 allocs/op
+BenchmarkUpdateDecode/nlri=40           	  597012	      2018 ns/op	    5320 B/op	      69 allocs/op
+BenchmarkUpdateDecode/nlri=40           	  599623	      2051 ns/op	    5320 B/op	      69 allocs/op
+BenchmarkUpdateDecode/nlri=40           	  590203	      2010 ns/op	    5320 B/op	      69 allocs/op
+BenchmarkUpdateDecode/nlri=40           	  598437	      2018 ns/op	    5320 B/op	      69 allocs/op
+PASS
+ok  	github.com/osrg/gobgp/v4/pkg/packet/bgp	49.406s
