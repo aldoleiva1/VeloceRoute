@@ -44,3 +44,5 @@ test/scenario_test/nosetest*.xml
 /lab/dashboard-linux
 /lab/clab-*/
 /lab/results/smoke-*.txt
+/lab/gobgpd-*
+/lab/results/discarded/

@@ -56,3 +56,21 @@ Change: `pkg/server/peer.go` only. Removed the per-UPDATE `pConf.ReadCopy()`/`Up
 r3 also improved (KB/route 6.1 -> 2.9). r1, which only originates the feed, did not (150 mallocs/route both runs), which is the expected control.
 Caveat: one run per configuration; r1's CPU moved 40 s -> 52 s with no relevant change, so expect roughly +/-20% run-to-run noise on CPU and GC pause. Repeat 3x before quoting percentages externally.
 Tests: `go test -race ./pkg/server/...` passes except 4 tests that also fail on untouched upstream on macOS (TestDisableMrt, TestEBGPRouteStuck, TestRTCDeferralTimerRaceCondition, TestTcpAoUpdatePeerWithClosedConnection: loopback alias 127.0.0.201 and TCP-AO are unavailable).
+
+## Variance runs: upstream vs branch (3 interleaved runs each, fresh daemons, 900k feed, r2)
+
+Upstream = commit f7daa917. Branch = same plus the two `peer.go` fixes. Runs alternated upstream/branch; each started fresh `gobgpd` on all three routers. Raw files: `results/upstream-run*.txt`, `results/branch-run*.txt`; table: `results/variance-summary.txt`. Host was under swap pressure (about 22 GB of 24 GB), so timing metrics carry noise.
+
+| r2 metric | upstream (mean [min..max]) | branch (mean [min..max]) | change | separated? |
+|---|---|---|---|---|
+| mallocs / route | 193.8 [193.3 .. 194.0] | 162.2 [162.1 .. 162.3] | -16% | yes (deterministic) |
+| KB / route | 8.8 [8.8 .. 8.8] | 5.5 [5.5 .. 5.6] | -37% | yes (deterministic) |
+| GC cycles | 57.0 [55 .. 58] | 33.7 [32 .. 35] | -41% | yes |
+| CPU seconds | 70.1 [64.0 .. 76.7] | 52.8 [47.5 .. 55.5] | -25% | yes (ranges do not overlap) |
+| converge r2+r3 | 23.5 s [21.7 .. 25.7] | 17.8 s [15.7 .. 19.0] | -24% | yes (ranges do not overlap) |
+| GC pause total | 112 ms [103 .. 129] | 83 ms [68 .. 109] | -25% | no (ranges overlap) |
+| peak RSS | 1682 MB [1623 .. 1741] | 1604 MB [1551 .. 1689] | -5% | no (ranges overlap) |
+
+Reading: allocation counts are essentially deterministic (spread under 0.5%), so the -16% mallocs and -37% bytes per route are solid. GC cycles, CPU and convergence time are separated by the observed ranges with n=3. GC pause total and RSS are not distinguishable from noise. The earlier single-run claim that total GC pause rose (89 -> 154 ms) was noise.
+
+Process notes: a first attempt failed because killed `gobgpd` processes linger as zombies (container PID 1 is `sleep`), which the wait loop counted; `ab.sh` now ignores zombies. Partial runs from before the fix are in `results/discarded/`.

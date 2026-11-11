@@ -1,0 +1,25 @@
+== upstream run1
+sent=900000 withdraw=false elapsed=10.958s rate=82133 paths/s
+converged_r2_r3_seconds=25.712611000
+saved results/upstream-run1-20261111-014904.txt
+== branch run1
+sent=900000 withdraw=false elapsed=11.947s rate=75335 paths/s
+converged_r2_r3_seconds=18.995840000
+saved results/branch-run1-20261111-014946.txt
+== upstream run2
+sent=900000 withdraw=false elapsed=10.565s rate=85189 paths/s
+converged_r2_r3_seconds=21.730165000
+saved results/upstream-run2-20261111-015020.txt
+== branch run2
+sent=900000 withdraw=false elapsed=12.261s rate=73405 paths/s
+converged_r2_r3_seconds=18.704272000
+saved results/branch-run2-20261111-015059.txt
+== upstream run3
+sent=900000 withdraw=false elapsed=10.103s rate=89080 paths/s
+converged_r2_r3_seconds=23.162724000
+saved results/upstream-run3-20261111-015133.txt
+== branch run3
+sent=900000 withdraw=false elapsed=9.947s rate=90478 paths/s
+converged_r2_r3_seconds=15.708384000
+saved results/branch-run3-20261111-015214.txt
+ALL-DONE
