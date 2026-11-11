@@ -14,7 +14,7 @@ Status of the product features and the task areas. A task is **done** only when 
 | Lab (3 routers, feed injector, dashboard, A/B tooling) | Working | `lab/`; `ab.sh`, `run-ab2.sh`, `summarize.py` | E6-3, E6-1 |
 | Blueprint corrected to v4 and checked against AWS docs | Done (A-3) | `docs/veloceroute/blueprint.md`, compiling sample | E5-1 |
 | A-1 variance runs | Done | 3x3 upstream vs branch in `lab/results/` | none |
-| E1 performance | In progress | Server fixes; encode path (allocations 26 to 10 per UPDATE); decode slab for IPv4 prefixes (40-prefix UPDATE 69 to 24 allocs). See `docs/veloceroute/performance.md` | shared-attribute `feedgen` to show the multi-prefix gain, then E1-3, E1-4, E1-5 |
+| E1 performance | In progress | Server fixes; encode path (allocations 26 to 10 per UPDATE); decode slab for IPv4 prefixes (40-prefix UPDATE 69 to 24 allocs). See `docs/veloceroute/performance.md` | E1-3, E1-4, E1-5 (shared-attribute `feedgen -share` is done) |
 | E1-1 encode `sync.Pool` | Mostly done | Append writer, exact buffers, pooled AS-path scratch. `NewBGPUpdateMessage` and the attribute-presence map are untouched | finish remaining 10 allocations |
 | Single static binary (`veloced`, E2) | Not started | none | E2-1 (needs A-4 decision) |
 | gRPC API and OpenConfig | Upstream only | GoBGP's own API; no WireGuard or FIB additions | E7 after E3/E4 |
@@ -57,7 +57,7 @@ AWS facts (full list with sources in `docs/veloceroute/blueprint.md`) confirmed 
 
 ## E1. Performance work (from CLAUDE.md tracker and profiling)
 
-Baseline to beat (r2, 900k import, mean of 3, upstream): 193.8 mallocs/route, 8.8 KB/route, 57 GC cycles, 70 s CPU, 23.5 s converge. After the two server fixes (mean of 3): 162.2 mallocs, 5.5 KB, 33.7 GC cycles, 52.8 s, 17.8 s. After the encode work (append build vs scratch build, n=4 vs 3): 154.2 to 139.9 mallocs/route. Details: `docs/veloceroute/performance.md`.
+Baseline to beat (r2, 900k import, mean of 3, upstream): 193.8 mallocs/route, 8.8 KB/route, 57 GC cycles, 70 s CPU, 23.5 s converge. After the two server fixes (mean of 3): 162.2 mallocs, 5.5 KB, 33.7 GC cycles, 52.8 s, 17.8 s. After the encode work (append build vs scratch build, n=4 vs 3): 154.2 to 139.9 mallocs/route. On a realistic feed (`feedgen -share 40`, about 37 prefixes per UPDATE; mean of 3, upstream vs all changes): 97.8 to 66.4 mallocs/route, 19.9 to 14.2 s CPU, 9.4 to 7.3 s converge. Details: `docs/veloceroute/performance.md`.
 
 | ID | Task | Done when | deps |
 |---|---|---|---|

@@ -9,7 +9,8 @@ def run(path):
         return {l.split()[0]: float(l.split()[1]) for l in m.group(1).strip().splitlines() if l[0] != '#'}
     b, a = grab('before', 'r2'), grab('after', 'r2')
     d = lambda k: a[k] - b[k]
-    return {
+    mu = re.search(r'updates_rcvd_r2_from_r1=(\d+)', t)
+    res = {
         'mallocs/route': d('go_memstats_mallocs_total') / N,
         'KB/route': d('go_memstats_alloc_bytes_total') / N / 1e3,
         'GC cycles': d('go_gc_duration_seconds_count'),
@@ -18,9 +19,12 @@ def run(path):
         'converge s': float(re.search(r'converged_r2_r3_seconds=([\d.]+)', t).group(1)),
         'RSS MB': a['process_resident_memory_bytes'] / 1e6,
     }
+    if mu:
+        res['routes/UPDATE'] = N / float(mu.group(1))
+    return res
 labels = sys.argv[1:]
 data = {l: [run(p) for p in sorted(glob.glob(f'results/{l}-run*.txt'))] for l in labels}
-metrics = list(next(iter(data.values()))[0].keys())
+metrics = [m for m in next(iter(data.values()))[0] if all(m in r for runs in data.values() for r in runs)]
 print(f"{'r2 metric':<15}" + ''.join(f"{l+' (n='+str(len(data[l]))+')':>34}" for l in labels) + (f"{'change':>10}" if len(labels) == 2 else ''))
 for m in metrics:
     row = f"{m:<15}"; means = []

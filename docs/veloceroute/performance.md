@@ -44,6 +44,35 @@ Changes 3 and 4 on top (append vs scratch build, n=4 vs n=3): mallocs/route
 154.2 to 139.9 (-9%, deterministic). CPU (-8%) and convergence (-7%) moved in
 the right direction but the ranges overlap, so treat them as unproven.
 
+## Realistic feed: 40 prefixes per attribute set
+
+`feedgen -share 40` makes 40 consecutive prefixes carry one attribute set, so
+GoBGP packs about 37 routes into each UPDATE (r2 received about 24,000 UPDATEs
+for 900,000 routes, instead of 900,000). This is closer to a real table. Three
+builds, interleaved, 3 runs each, r2, 900k routes
+(`lab/results/share40-*`, `lab/results/variance-summary-share40.txt`):
+
+| metric | upstream | server fixes only | all changes | all vs upstream |
+|---|---|---|---|---|
+| mallocs/route | 97.8 | 75.7 | 66.4 | **-32%** |
+| KB/route | 3.7 | 2.9 | 2.8 | -26% |
+| GC cycles | 28.7 | 25.7 | 24.7 | -14% |
+| GC pause (ms) | 49.3 | 31.3 | 33.6 | -32% |
+| CPU (s) | 19.9 | 15.2 | 14.2 | **-29%** |
+| converge (s) | 9.4 | 7.5 | 7.3 | **-22%** |
+| RSS (MB) | 1269 | 1115 | 1103 | -13% |
+
+Reading it:
+
+- The two server fixes give most of the gain (mallocs -23%, CPU -24%, convergence -20%).
+- The packet-layer changes (encode and decode) add a further 12% fewer mallocs
+  per route. The CPU (-7%) and convergence (-2%) improvements on top of the server
+  fixes are inside the run-to-run spread (CPU ranges 13.4-16.9 s vs 13.7-15.2 s),
+  so only the allocation count is a firm result there.
+- All changes together vs upstream: CPU and convergence ranges do not overlap.
+- Per-route cost is lower with shared attributes than with one prefix per UPDATE
+  (66 vs 140 mallocs), because attribute work is amortized over about 37 prefixes.
+
 ## 1. Per-UPDATE config copy (`pkg/server/peer.go`)
 
 **What upstream did.** `handleUpdate` called `pConf.ReadCopy()` for every UPDATE
@@ -166,12 +195,12 @@ first) was caught by both tests.
 | 1 prefix | 530 ns, 664 B, 24 allocs | 530 ns, 664 B, 24 allocs |
 | 40 prefixes | 1952 ns, 5320 B, 69 allocs | 1115 ns, 3040 B, 24 allocs |
 
-**Lab result: no measurable change** (r2, 900k routes, scratch n=6 vs decode n=3:
-mallocs/route 140.0 vs 139.9, CPU 34.4 vs 33.2 s, converge 13.3 vs 12.9 s, all
-within run spread). This is expected: `feedgen` puts one prefix in each UPDATE, and
-with one prefix the slab saves nothing. The change should matter on real tables
-where many prefixes share attributes; proving that needs the shared-attribute
-mode for `feedgen` (not built yet). IPv6 (`MP_REACH_NLRI`) decode is not changed.
+**Lab result.** With one prefix per UPDATE there is no measurable change (scratch
+n=6 vs decode n=3: mallocs/route 140.0 vs 139.9, CPU 34.4 vs 33.2 s, converge 13.3
+vs 12.9 s, all within run spread), as expected since the slab saves nothing for a
+single prefix. With about 37 prefixes per UPDATE (`-share 40`) the packet-layer
+changes together cut mallocs/route by 12% (75.7 to 66.4); see the realistic-feed
+section. IPv6 (`MP_REACH_NLRI`) decode is not changed.
 
 ## How it was verified
 
@@ -224,10 +253,10 @@ records r2/r3 runtime metrics from Prometheus on :6060).
 
 ## Limits of the measurements
 
-- The synthetic feed (`lab/tools/feedgen`) gives nearly every prefix its own AS
-  path, so each UPDATE carries one prefix. Real tables share attributes across
-  many prefixes, so the 40-prefix encode gain is closer to real behavior than the
-  1-prefix lab result. A shared-attribute mode for `feedgen` is planned.
+- By default the synthetic feed (`lab/tools/feedgen`) gives every prefix its own
+  AS path, so each UPDATE carries one prefix. Use `-share 40` for a feed where
+  UPDATEs carry about 37 prefixes (see the section above). Real tables vary; the
+  true mix of prefixes per UPDATE depends on the peer. The feed is IPv4 /24s only.
 - The lab runs in Docker Desktop on one laptop with swap nearly full. CPU and
   convergence time are noisy (run-to-run spread of 10-15%); allocation counts
   per route are deterministic and are the reliable signal.

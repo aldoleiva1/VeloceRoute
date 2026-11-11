@@ -1,5 +1,9 @@
 // feedgen injects a synthetic full-table IPv4 feed into a gobgpd over gRPC.
-// Usage: feedgen -addr 127.0.0.1:50051 -n 900000 -batch 1000
+// Usage: feedgen -addr 127.0.0.1:50051 -n 900000 -batch 1000 [-share 40]
+//
+// -share K makes K consecutive prefixes carry one identical attribute set (as in
+// real tables, where many prefixes share an AS path). The default, 1, gives every
+// prefix its own attributes; that feed is unchanged so earlier results stay comparable.
 package main
 
 import (
@@ -23,8 +27,12 @@ func main() {
 	n := flag.Int("n", 900000, "number of /24 prefixes")
 	batch := flag.Int("batch", 1000, "paths per stream message")
 	nh := flag.String("nexthop", "10.0.12.1", "next hop")
+	share := flag.Int("share", 1, "consecutive prefixes that share one attribute set (1 = every prefix distinct)")
 	withdraw := flag.Bool("withdraw", false, "withdraw the same feed instead of adding")
 	flag.Parse()
+	if *share < 1 {
+		fatal(fmt.Errorf("-share must be >= 1"))
+	}
 
 	conn, err := grpc.NewClient(*addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -59,6 +67,7 @@ func main() {
 		paths = make([]*api.Path, 0, *batch)
 	}
 
+	var attrs []bgp.PathAttributeInterface
 	addrU := uint32(1 << 24)
 	for count := 0; count < *n; {
 		first := addrU >> 24
@@ -75,23 +84,25 @@ func main() {
 		if err != nil {
 			fatal(err)
 		}
-		plen := 2 + rng.Intn(5)
-		seq := make([]uint32, plen)
-		for i := range seq {
-			seq[i] = asPool[rng.Intn(len(asPool))]
-		}
-		nhAttr, _ := bgp.NewPathAttributeNextHop(nhAddr)
-		attrs := []bgp.PathAttributeInterface{
-			bgp.NewPathAttributeOrigin(0),
-			bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, seq)}),
-			nhAttr,
-		}
-		if nc := rng.Intn(4); nc > 0 {
-			comms := make([]uint32, nc)
-			for i := range comms {
-				comms[i] = uint32(seq[0])<<16 | uint32(rng.Intn(1000))
+		if count%*share == 0 {
+			plen := 2 + rng.Intn(5)
+			seq := make([]uint32, plen)
+			for i := range seq {
+				seq[i] = asPool[rng.Intn(len(asPool))]
 			}
-			attrs = append(attrs, bgp.NewPathAttributeCommunities(comms))
+			nhAttr, _ := bgp.NewPathAttributeNextHop(nhAddr)
+			attrs = []bgp.PathAttributeInterface{
+				bgp.NewPathAttributeOrigin(0),
+				bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, seq)}),
+				nhAttr,
+			}
+			if nc := rng.Intn(4); nc > 0 {
+				comms := make([]uint32, nc)
+				for i := range comms {
+					comms[i] = uint32(seq[0])<<16 | uint32(rng.Intn(1000))
+				}
+				attrs = append(attrs, bgp.NewPathAttributeCommunities(comms))
+			}
 		}
 		p, err := apiutil.NewPath(bgp.RF_IPv4_UC, nlri, *withdraw, attrs, time.Now())
 		if err != nil {

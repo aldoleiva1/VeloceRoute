@@ -22,7 +22,9 @@ All performance work; details, code walk-through and verification are in [docs/v
 | Removed a per-UPDATE peer-config copy; debug-log arguments built only when debug is on | `pkg/server/peer.go` | 37% fewer bytes and 41% fewer GC cycles per route on a transit router importing 900k routes (n=3) |
 | Append-style NLRI writer, one buffer per UPDATE | `pkg/packet/bgp/bgp.go` | UPDATE encode allocations 26 to 17 (1 prefix), 184 to 17 (40 prefixes) |
 | Exact-size attribute buffers, header and body in one buffer, pooled AS-path scratch | `pkg/packet/bgp/bgp.go` | Encode allocations 17 to 10; 9% fewer mallocs per route in the lab |
-| Decode: one slab of prefix structs per UPDATE | `pkg/packet/bgp/bgp.go` | 40-prefix UPDATE decode 69 to 24 allocations; no change in the lab, whose feed has one prefix per UPDATE |
+| Decode: one slab of prefix structs per UPDATE | `pkg/packet/bgp/bgp.go` | 40-prefix UPDATE decode 69 to 24 allocations |
+
+On a feed where about 37 prefixes share each UPDATE (r2, 900k routes, n=3 each), all changes together vs upstream: 32% fewer mallocs per route, 29% less CPU, 22% faster convergence. Details in [docs/veloceroute/performance.md](docs/veloceroute/performance.md).
 
 ## Where the work is tracked
 
