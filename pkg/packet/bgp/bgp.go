@@ -31,6 +31,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type MarshallingOption struct {
@@ -12528,12 +12529,15 @@ func (p *PathAttribute) Serialize(value []byte, options ...*MarshallingOption) (
 	if flags&BGP_ATTR_FLAG_EXTENDED_LENGTH == 0 && length > 255 {
 		flags |= BGP_ATTR_FLAG_EXTENDED_LENGTH
 	}
+	// One exactly-sized allocation: header and value together.
 	var buf []byte
 	if flags&BGP_ATTR_FLAG_EXTENDED_LENGTH != 0 {
-		buf = append(make([]byte, 4), value...)
+		buf = make([]byte, 4+len(value))
+		copy(buf[4:], value)
 		binary.BigEndian.PutUint16(buf[2:4], length)
 	} else {
-		buf = append(make([]byte, 3), value...)
+		buf = make([]byte, 3+len(value))
+		copy(buf[3:], value)
 		buf[2] = byte(length)
 	}
 	buf[0] = uint8(flags)
@@ -12891,16 +12895,39 @@ func (p *PathAttributeAsPath) DecodeFromBytes(data []byte, options ...*Marshalli
 	return nil
 }
 
+// scratchPool holds temporary buffers for attribute values that are copied
+// into an exactly-sized result before the serializer returns. Nothing taken
+// from the pool may escape: PathAttribute.Serialize copies the value, so the
+// scratch can be recycled right after.
+var scratchPool = sync.Pool{New: func() any { b := make([]byte, 0, 256); return &b }}
+
+func getScratch() *[]byte { return scratchPool.Get().(*[]byte) }
+
+func putScratch(b *[]byte) {
+	// Do not keep very large buffers alive in the pool.
+	if cap(*b) > 64<<10 {
+		return
+	}
+	*b = (*b)[:0]
+	scratchPool.Put(b)
+}
+
 func (p *PathAttributeAsPath) Serialize(options ...*MarshallingOption) ([]byte, error) {
-	buf := make([]byte, 0)
+	sp := getScratch()
+	buf := *sp
 	for _, v := range p.Value {
 		vbuf, err := v.Serialize()
 		if err != nil {
+			*sp = buf
+			putScratch(sp)
 			return nil, err
 		}
 		buf = append(buf, vbuf...)
 	}
-	return p.PathAttribute.Serialize(buf, options...)
+	out, err := p.PathAttribute.Serialize(buf, options...)
+	*sp = buf
+	putScratch(sp)
+	return out, err
 }
 
 func (p *PathAttributeAsPath) String() string {
@@ -17630,20 +17657,40 @@ func (msg *BGPUpdate) DecodeFromBytes(data []byte, options ...*MarshallingOption
 }
 
 func (msg *BGPUpdate) Serialize(options ...*MarshallingOption) ([]byte, error) {
+	buf, err := msg.appendBody(make([]byte, 0, msg.sizeHint()), options...)
+	if err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+func (msg *BGPUpdate) sizeHint() int {
+	return 4 + 8*(len(msg.WithdrawnRoutes)+len(msg.NLRI)) + 32*len(msg.PathAttributes)
+}
+
+// appendBody appends the serialized UPDATE body to dst. BGPMessage.Serialize
+// passes a buffer that already holds the header so the body is written once.
+func (msg *BGPUpdate) appendBody(dst []byte, options ...*MarshallingOption) ([]byte, error) {
 	v4AddPath := IsAddPathEnabled(false, RF_IPv4_UC, options)
 
 	// Build the whole body in one buffer: 2 octets of withdrawn length, the
 	// withdrawn routes, 2 octets of attribute length, the attributes, then
 	// the NLRI. The length fields are patched in place.
-	buf := make([]byte, 2, 4+8*(len(msg.WithdrawnRoutes)+len(msg.NLRI))+32*len(msg.PathAttributes))
+	base := len(dst)
+	buf := append(dst, 0, 0)
 	var err error
 	for i := range msg.WithdrawnRoutes {
 		if buf, err = msg.WithdrawnRoutes[i].appendTo(buf, v4AddPath); err != nil {
 			return nil, err
 		}
 	}
-	msg.WithdrawnRoutesLen = uint16(len(buf) - 2)
-	binary.BigEndian.PutUint16(buf, msg.WithdrawnRoutesLen)
+	wlen := uint16(len(buf) - base - 2)
+	if msg.WithdrawnRoutesLen != wlen {
+		// Only write when it changed: a received message is shared between
+		// goroutines and already carries the decoded length.
+		msg.WithdrawnRoutesLen = wlen
+	}
+	binary.BigEndian.PutUint16(buf[base:], wlen)
 
 	attributes := getBGPUpdateAttributesFromMsg(msg)
 	o := MarshallingOption{
@@ -17659,8 +17706,11 @@ func (msg *BGPUpdate) Serialize(options ...*MarshallingOption) ([]byte, error) {
 		}
 		buf = append(buf, onepbuf...)
 	}
-	msg.TotalPathAttributeLen = uint16(len(buf) - attrLenAt - 2)
-	binary.BigEndian.PutUint16(buf[attrLenAt:], msg.TotalPathAttributeLen)
+	alen := uint16(len(buf) - attrLenAt - 2)
+	if msg.TotalPathAttributeLen != alen {
+		msg.TotalPathAttributeLen = alen
+	}
+	binary.BigEndian.PutUint16(buf[attrLenAt:], alen)
 
 	for i := range msg.NLRI {
 		if buf, err = msg.NLRI[i].appendTo(buf, v4AddPath); err != nil {
@@ -17885,12 +17935,17 @@ func (msg *BGPHeader) DecodeFromBytes(data []byte, options ...*MarshallingOption
 // from their own goroutines.
 func (msg *BGPHeader) serialize(length uint16) []byte {
 	buf := make([]byte, BGP_HEADER_LENGTH)
+	msg.putHeader(buf, length)
+	return buf
+}
+
+// putHeader writes the header into the first BGP_HEADER_LENGTH octets of buf.
+func (msg *BGPHeader) putHeader(buf []byte, length uint16) {
 	for i := range buf[:16] {
 		buf[i] = 0xff
 	}
 	binary.BigEndian.PutUint16(buf[16:18], length)
 	buf[18] = msg.Type
-	return buf
 }
 
 func (msg *BGPHeader) Serialize(options ...*MarshallingOption) ([]byte, error) {
@@ -17980,6 +18035,9 @@ func ParseBGPBody(h *BGPHeader, data []byte, options ...*MarshallingOption) (*BG
 }
 
 func (msg *BGPMessage) Serialize(options ...*MarshallingOption) ([]byte, error) {
+	if u, ok := msg.Body.(*BGPUpdate); ok {
+		return msg.serializeUpdate(u, options...)
+	}
 	b, err := msg.Body.Serialize(options...)
 	if err != nil {
 		return nil, err
@@ -18006,6 +18064,29 @@ func (msg *BGPMessage) Serialize(options ...*MarshallingOption) ([]byte, error) 
 		length = BGP_HEADER_LENGTH + uint16(len(b))
 	}
 	return append(msg.Header.serialize(length), b...), nil
+}
+
+// serializeUpdate writes header and UPDATE body into one buffer, avoiding the
+// copy that prepending the header to a separately built body would cost.
+func (msg *BGPMessage) serializeUpdate(u *BGPUpdate, options ...*MarshallingOption) ([]byte, error) {
+	buf := make([]byte, BGP_HEADER_LENGTH, BGP_HEADER_LENGTH+u.sizeHint())
+	buf, err := u.appendBody(buf, options...)
+	if err != nil {
+		return nil, err
+	}
+	length := msg.Header.Len
+	if length == 0 {
+		maxLen := BGP_MAX_MESSAGE_LENGTH
+		if IsExtendedMessageSerialization(options) {
+			maxLen = BGP_MAX_EXTENDED_MESSAGE_LENGTH
+		}
+		if len(buf) > maxLen {
+			return nil, NewMessageError(0, 0, nil, fmt.Sprintf("too long message length %d", len(buf)))
+		}
+		length = uint16(len(buf))
+	}
+	msg.Header.putHeader(buf, length)
+	return buf, nil
 }
 
 type ErrorHandling int

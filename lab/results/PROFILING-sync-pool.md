@@ -112,3 +112,37 @@ Lab, one run on r2 (n=1, indicative only): mallocs/route 162.2 -> 154.2, CPU 52.
 Why the lab gain is smaller than the benchmark: `feedgen` gives almost every prefix its own AS path, so each UPDATE carries one prefix, and the saving is the 9 allocations of the nlri=1 case (about 8 per route observed). Real internet tables pack many prefixes behind shared attributes, so the nlri=40 style gain should show up there. Consider adding a mode to `feedgen` that shares attributes across prefixes.
 
 Remaining encode allocations (17 per UPDATE) are fixed cost: per-attribute buffers, the message header copy and the attribute list helper. Next candidates: pre-size `PathAttribute.Serialize` (2 allocs to 1), reserve header space so `BGPMessage.Serialize` does not copy the body, and pool the scratch buffers.
+
+## Encode, round 3: exact attribute buffers, single-buffer message, pooled AS-path scratch
+
+Changes (`pkg/packet/bgp/bgp.go`):
+- `PathAttribute.Serialize`: one exactly-sized allocation instead of `make` + `append`.
+- `BGPMessage.Serialize` for UPDATEs: header and body are built in one buffer
+  (`serializeUpdate` / `BGPUpdate.appendBody`), removing the body copy.
+- `PathAttributeAsPath.Serialize`: the concatenation scratch comes from a
+  `sync.Pool` (`scratchPool`). It is safe because `PathAttribute.Serialize` copies
+  the value before the scratch is returned; nothing pooled escapes. Buffers over
+  64 KiB are not retained.
+- `BGPUpdate` cached length fields are written only when the value changes, so a
+  received message shared across goroutines is no longer written on every serialize
+  (the old code wrote them on every call, which `-race` flags under concurrent use).
+
+Benchmarks (median of 8, `lab/results/bench-after-scratch-pool.txt`):
+
+| case | before (round 2) | after |
+|---|---|---|
+| UpdateSerialize nlri=1 | 349 ns, 472 B, 17 allocs | 262 ns, 344 B, 10 allocs |
+| UpdateSerialize nlri=40 | 622 ns, 968 B, 17 allocs | 522 ns, 664 B, 10 allocs |
+| UpdateDecode | unchanged | unchanged |
+
+Tests: `TestMessageSerializeMatchesLegacy` (full message with header, extended
+length attributes, extended-message limit) and `TestSerializeConcurrentPool`
+(8 goroutines, `-race`). Lab end-to-end runs for this build are not done yet.
+
+### Lab, interleaved append vs scratch (r2, 900k routes; append n=4 incl. the earlier run, scratch n=3)
+
+mallocs/route 154.2 -> 139.9 (-9%, deterministic), KB/route 5.5 -> 5.2 (-4%),
+GC cycles 32.5 -> 32.0, GC pause unchanged, CPU 39.9 -> 36.7 s (-8%) and
+converge 14.7 -> 13.7 s (-7%) but the ranges overlap, so those two are not
+distinguishable from noise at n=3. RSS +3% (within run spread). Raw: `results/{append,scratch}-run*.txt`,
+table: `results/variance-summary-scratch.txt`. Swap was near full during the runs.

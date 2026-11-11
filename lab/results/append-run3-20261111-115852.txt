@@ -1,0 +1,69 @@
+label=append-run3 n=900000 date=2026-11-11T17:58:52Z
+# before r1
+go_gc_duration_seconds_sum 0.000553251
+go_gc_duration_seconds_count 2
+go_goroutines 20
+go_memstats_alloc_bytes 5.0288e+06
+go_memstats_alloc_bytes_total 6.353608e+06
+go_memstats_heap_inuse_bytes 7.012352e+06
+go_memstats_mallocs_total 19124
+go_memstats_sys_bytes 1.8716936e+07
+process_cpu_seconds_total 0.03
+process_resident_memory_bytes 2.906112e+07
+# before r2
+go_gc_duration_seconds_sum 0.000234666
+go_gc_duration_seconds_count 3
+go_goroutines 25
+go_memstats_alloc_bytes 5.171984e+06
+go_memstats_alloc_bytes_total 7.974944e+06
+go_memstats_heap_inuse_bytes 7.503872e+06
+go_memstats_mallocs_total 30763
+go_memstats_sys_bytes 1.9527944e+07
+process_cpu_seconds_total 0.03
+process_resident_memory_bytes 3.037184e+07
+# before r3
+go_gc_duration_seconds_sum 0.000279667
+go_gc_duration_seconds_count 1
+go_goroutines 20
+go_memstats_alloc_bytes 2.664664e+06
+go_memstats_alloc_bytes_total 3.45564e+06
+go_memstats_heap_inuse_bytes 4.83328e+06
+go_memstats_mallocs_total 14433
+go_memstats_sys_bytes 1.8381064e+07
+process_cpu_seconds_total 0.03
+process_resident_memory_bytes 2.8680192e+07
+sent=900000 withdraw=false elapsed=10.045s rate=89597 paths/s
+converged_r2_r3_seconds=15.127416000
+# after r1
+go_gc_duration_seconds_sum 0.047313962
+go_gc_duration_seconds_count 43
+go_goroutines 20
+go_memstats_alloc_bytes 1.121548672e+09
+go_memstats_alloc_bytes_total 5.302407184e+09
+go_memstats_heap_inuse_bytes 1.240711168e+09
+go_memstats_mallocs_total 1.28051059e+08
+go_memstats_sys_bytes 1.455774536e+09
+process_cpu_seconds_total 31.45
+process_resident_memory_bytes 1.466642432e+09
+# after r2
+go_gc_duration_seconds_sum 0.058366622
+go_gc_duration_seconds_count 35
+go_goroutines 25
+go_memstats_alloc_bytes 1.334568472e+09
+go_memstats_alloc_bytes_total 4.913554808e+09
+go_memstats_heap_inuse_bytes 1.555472384e+09
+go_memstats_mallocs_total 1.3873866e+08
+go_memstats_sys_bytes 1.69010676e+09
+process_cpu_seconds_total 41.22
+process_resident_memory_bytes 1.7010688e+09
+# after r3
+go_gc_duration_seconds_sum 0.048385707
+go_gc_duration_seconds_count 29
+go_goroutines 20
+go_memstats_alloc_bytes 8.81026264e+08
+go_memstats_alloc_bytes_total 2.591144624e+09
+go_memstats_heap_inuse_bytes 9.90191616e+08
+go_memstats_mallocs_total 7.7944648e+07
+go_memstats_sys_bytes 1.083375608e+09
+process_cpu_seconds_total 23.65
+process_resident_memory_bytes 1.093378048e+09

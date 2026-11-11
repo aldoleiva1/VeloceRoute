@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"math/rand"
 	"net/netip"
+	"sync"
 	"testing"
 )
 
@@ -203,4 +204,91 @@ func TestUpdateSerializeMatchesLegacy(t *testing.T) {
 			}
 		}
 	}
+}
+
+// legacyMessageSerialize is the pre-change BGPMessage.Serialize for UPDATEs:
+// header prepended to a separately built body.
+func legacyMessageSerialize(msg *BGPMessage, options ...*MarshallingOption) ([]byte, error) {
+	b, err := legacyUpdateSerialize(msg.Body.(*BGPUpdate), options...)
+	if err != nil {
+		return nil, err
+	}
+	length := msg.Header.Len
+	if length == 0 {
+		maxLen := BGP_MAX_MESSAGE_LENGTH
+		if IsExtendedMessageSerialization(options) {
+			maxLen = BGP_MAX_EXTENDED_MESSAGE_LENGTH
+		}
+		if BGP_HEADER_LENGTH+len(b) > maxLen {
+			return nil, NewMessageError(0, 0, nil, "too long")
+		}
+		length = BGP_HEADER_LENGTH + uint16(len(b))
+	}
+	return append(msg.Header.serialize(length), b...), nil
+}
+
+func TestMessageSerializeMatchesLegacy(t *testing.T) {
+	rng := rand.New(rand.NewSource(5))
+	nh, _ := NewPathAttributeNextHop(netip.MustParseAddr("10.0.12.1"))
+	for iter := 0; iter < 300; iter++ {
+		var nl []PathNLRI
+		// Vary size so some messages cross the 4096 limit.
+		for i, n := 0, rng.Intn(900); i < n; i++ {
+			nl = append(nl, PathNLRI{NLRI: randPrefix(t, rng, false)})
+		}
+		asns := make([]uint32, rng.Intn(100)) // long AS paths exercise extended-length attrs
+		for i := range asns {
+			asns[i] = rng.Uint32()
+		}
+		attrs := []PathAttributeInterface{
+			NewPathAttributeOrigin(0),
+			NewPathAttributeAsPath([]AsPathParamInterface{NewAs4PathParam(BGP_ASPATH_ATTR_TYPE_SEQ, asns)}),
+			nh,
+		}
+		for _, ext := range []bool{false, true} {
+			opts := []*MarshallingOption{{ExtendedMessage: ext}}
+			m := NewBGPUpdateMessage(nil, attrs, nl)
+			want, werr := legacyMessageSerialize(m, opts...)
+			got, gerr := m.Serialize(opts...)
+			if (werr == nil) != (gerr == nil) || !bytes.Equal(want, got) {
+				t.Fatalf("iter %d ext=%v: differ (err got=%v want=%v)", iter, ext, gerr, werr)
+			}
+		}
+	}
+}
+
+// Concurrent serialization of one shared message must be race-free and
+// stable now that scratch buffers come from a pool.
+func TestSerializeConcurrentPool(t *testing.T) {
+	nh, _ := NewPathAttributeNextHop(netip.MustParseAddr("10.0.12.1"))
+	attrs := []PathAttributeInterface{
+		NewPathAttributeOrigin(0),
+		NewPathAttributeAsPath([]AsPathParamInterface{NewAs4PathParam(BGP_ASPATH_ATTR_TYPE_SEQ, []uint32{65001, 65002, 65003})}),
+		nh,
+	}
+	pfx, err := NewIPAddrPrefix(netip.MustParsePrefix("192.0.2.0/24"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := NewBGPUpdateMessage(nil, attrs, []PathNLRI{{NLRI: pfx}})
+	want, err := m.Serialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first call fills the cached length fields; later calls only read.
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 2000; i++ {
+				got, err := m.Serialize()
+				if err != nil || !bytes.Equal(got, want) {
+					t.Errorf("concurrent serialize mismatch: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
