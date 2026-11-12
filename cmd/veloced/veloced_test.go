@@ -331,7 +331,7 @@ func TestFibStageOrderAndCleanup(t *testing.T) {
 	logs := &syncBuffer{}
 	logger, lvl := newLogger(cfg, logs)
 	stale := netip.MustParsePrefix("198.51.100.0/24")
-	k := &fakeKernel{owned: []fib.Route{{Prefix: stale, NextHop: netip.MustParseAddr("10.0.0.2")}}}
+	k := &fakeKernel{owned: []fib.Route{{Prefix: stale, NextHops: []netip.Addr{netip.MustParseAddr("10.0.0.2")}}}}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -390,5 +390,45 @@ func TestFibStageFailsFastWithoutPrivileges(t *testing.T) {
 	if c, derr := net.DialTimeout("tcp", addr, time.Second); derr == nil {
 		c.Close()
 		t.Fatal("the gRPC API was left running after a failed start")
+	}
+}
+
+func TestMultipathFlags(t *testing.T) {
+	base := []string{"-asn", "65001", "-router-id", "10.0.0.1"}
+	c, err := parseFlags(base, io.Discard)
+	if err != nil || c.Multipath || c.FibMaxPaths != fib.DefaultMaxNextHops {
+		t.Fatalf("defaults: %+v %v", c, err)
+	}
+	c, err = parseFlags(append(append([]string{}, base...), "-multipath", "-fib-max-paths", "8"), io.Discard)
+	if err != nil || !c.Multipath || c.FibMaxPaths != 8 {
+		t.Fatalf("flags not parsed: %+v %v", c, err)
+	}
+	if runtime.GOOS == "linux" {
+		if _, err := parseFlags(append(append([]string{}, base...), "-fib-sync", "-fib-max-paths", "0"), io.Discard); err == nil {
+			t.Error("-fib-max-paths 0 must be refused")
+		}
+	}
+}
+
+// -multipath must reach the BGP engine: without it GoBGP keeps only the best
+// path per prefix and kernel sync could never see the other equal-cost paths.
+func TestMultipathFlagReachesTheBgpEngine(t *testing.T) {
+	for _, on := range []bool{false, true} {
+		cfg := &config{ASN: 65001, RouterID: "10.0.0.1", ListenPort: -1, GrpcAddr: freePort(t), LogLevel: "error", LogFormat: "text", Multipath: on}
+		logger, lvl := newLogger(cfg, io.Discard)
+		d := &daemon{}
+		st := bgpStage(cfg, logger, lvl, d)
+		ctx := context.Background()
+		if err := st.start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		r, err := d.bgp.GetBgp(ctx, &api.GetBgpRequest{})
+		_ = st.stop(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Global.UseMultiplePaths != on {
+			t.Errorf("-multipath=%v but the engine has use-multiple-paths=%v", on, r.Global.UseMultiplePaths)
+		}
 	}
 }

@@ -52,3 +52,9 @@ By default `feedgen` gives every prefix its own AS path (one prefix per UPDATE).
     ./fib-demo.sh /tmp/veloced-linux      # 11 checks; restores gobgpd on all routers afterwards
 
 Swaps `veloced -fib-sync` in for r2's daemon and checks r2's kernel table (see `../docs/veloceroute/fib.md`). Output of the last run: `results/fib-live-test.txt`.
+
+## ECMP live test
+
+    ./ecmp-demo.sh /tmp/veloced-linux     # 15 checks; restores gobgpd on all routers afterwards
+
+r1 and r3 advertise the same prefixes to r2, which runs `veloced -fib-sync -multipath`; checks the single multipath route, shrink and grow on withdrawal and session loss, the run without `-multipath`, and crash recovery. Output of the last run: `results/ecmp-live-test.txt`.

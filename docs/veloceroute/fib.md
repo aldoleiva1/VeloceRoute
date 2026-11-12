@@ -2,7 +2,7 @@
 
 `veloced -fib-sync` copies BGP best paths into the Linux kernel routing table, so
 the host actually forwards traffic along what BGP learned. GoBGP by itself only
-computes routes. Roadmap task E4-1; see [ROADMAP.md](../../ROADMAP.md) section E4 for
+computes routes. Roadmap tasks E4-1 and E4-3 (ECMP); see [ROADMAP.md](../../ROADMAP.md) section E4 for
 what is still to come.
 
 Source: [`internal/pkg/fib/`](../../internal/pkg/fib/), wired into
@@ -21,6 +21,8 @@ ip route show proto 201                                   # the routes veloced o
 | `-fib-protocol` | 201 | route protocol id stamped on our routes (5 to 255; 0 to 4 are the kernel's own) |
 | `-fib-table` | 254 (main) | routing table to program |
 | `-fib-metric` | 20 | route metric; must be at least 1 (see below) |
+| `-multipath` | off | keep every equal-cost BGP path, so the kernel route gets all their next hops (see ECMP) |
+| `-fib-max-paths` | 64 | most next hops in one ECMP route (used with `-multipath`) |
 
 Peers are not configurable from a file yet (task E2-2); add them with the `gobgp`
 CLI against the daemon's gRPC API, for example `gobgp neighbor add 10.0.12.1 as 65001`.
@@ -47,6 +49,43 @@ CLI against the daemon's gRPC API, for example `gobgp neighbor add 10.0.12.1 as 
    - anything else (other address families, labeled or VPN prefixes): ignored.
 4. **Stop** (before `bgp` stops). It removes every route it installed and ignores
    events still in flight, so a late event cannot put a route back after cleanup.
+
+## ECMP (multiple equal-cost paths)
+
+With `-multipath`, `veloced` starts GoBGP with `use-multiple-paths`, and a prefix learned
+from several peers over equal-cost paths becomes **one kernel route with all their next
+hops** (`ip route` shows `nexthop via ...` lines, and the kernel spreads flows over
+them). Without `-multipath` nothing changes: one best path, one next hop.
+
+How it works, and why it is not just "add the next hops":
+
+- **The event stream changes meaning.** Without multipath, an event says "this is the
+  new best path", so a path from another peer *replaces* the old one. With multipath, GoBGP
+  reports each equal-cost path as its own change: an update for a path that joined or
+  changed, a withdrawal for a path that left (this includes every path of a peer whose
+  session went down). The syncer is told which mode it is in (`fib.WithMultipath`) and
+  keeps, per prefix, the eligible paths by source (peer address plus add-path id). The
+  kernel route is rebuilt from that set: sorted, with duplicates removed, so the same
+  paths always give the same route whatever order they arrived in.
+- **One kernel change per prefix per event.** All paths of a prefix in one event are
+  applied together, so the kernel never sees a half-built set and a 3-path event is one
+  `RouteReplace`, not three.
+- **The whole set is replaced at once** (`RTA_MULTIPATH`), IPv4 and IPv6, so traffic
+  is never forwarded over a half-updated route. Repeating an event changes nothing.
+- **An unreachable next hop does not take the others down.** The kernel refuses a
+  multipath route if any next hop is unreachable. On that failure the syncer tries each
+  next hop alone to find the reachable ones, installs those together, logs one warning
+  naming the ones left out, and counts them in `Stats.Unreachable`. This costs extra
+  kernel calls only on that failure path. If none is reachable, no route is installed
+  and the old one is removed.
+- **A cap** (`-fib-max-paths`, default 64) keeps the lowest next hop addresses and
+  logs a warning, so the choice does not change between events.
+- Ownership is unchanged: the same protocol, table and metric, deleted by prefix,
+  so our ECMP route and someone else's route for the same prefix coexist and deleting
+  ours leaves theirs (tested).
+
+Not done: **weights** (unequal-cost / UCMP) and next hop groups (`nhid`). Every next
+hop has weight 1.
 
 ## Safety: it only ever touches its own routes
 
@@ -105,6 +144,29 @@ reported as `ErrNextHopUnreachable`, the default route, IPv6, option validation,
 the whole syncer on a real kernel with stale-route reconcile. All pass; unprivileged,
 the namespace tests skip and the rest pass.
 
+ECMP adds kernel tests for IPv4 and IPv6 (install two next hops, grow to three, change
+the set, shrink to a single route, grow again from a single route, delete leaves
+nothing behind, `ListOwned` reports one route with sorted next hops), an unreachable
+next hop in a multipath route leaving the old route untouched, a static route for the
+same prefix surviving, and the syncer on a real kernel including the unreachable
+fallback. The IPv6 case matters because the kernel handles IPv6 multipath routes
+differently from IPv4; it passes on the Docker Desktop kernel.
+
+`TestWatchMultipathBuildsAndShrinksEcmpRoute` runs three real BGP servers on loopback
+(127.0.0.1 and 127.0.0.2 as peer addresses, so it is skipped on macOS): the syncer must
+build the ECMP route from two peers, shrink it on an explicit withdrawal, grow it
+again, and shrink it when one session drops. I checked the tests catch bugs by
+planting three: treating multipath events as best paths, applying per path instead of
+per event, and not removing duplicate next hops. Each made tests fail.
+
+**Live ECMP test in the lab** (`lab/ecmp-demo.sh`, output in `lab/results/ecmp-live-test.txt`,
+15 checks, all pass): r1 and r3 both advertise the same prefixes to r2, which runs
+`veloced -fib-sync -multipath`. A shared prefix is one kernel route with both next hops
+(`proto 201 metric 20`); prefixes from one router have one; a withdrawal and a session
+going down each shrink the route, and re-advertising and the session returning grow it;
+SIGTERM removes it; the same paths without `-multipath` give a single next hop;
+after `kill -9` the stale ECMP route is removed on the next start.
+
 **Live test in the lab** (`lab/fib-demo.sh`, output in `lab/results/fib-live-test.txt`,
 11 checks, all pass): `veloced -fib-sync` replaces `gobgpd` on r2 and peers with r1
 and r3. Learned prefixes appear in `ip route show proto 201`; a prefix overlapping r2's
@@ -120,8 +182,12 @@ meaning the current namespace) with a regression test of the default path.
 
 ## Known limits
 
-- **One next hop per prefix (no ECMP).** If GoBGP is configured for multipath, events
-  carry several paths for one prefix and the last one wins in the kernel. ECMP is task E4-3.
+- **ECMP needs `-multipath`.** If GoBGP has multiple paths enabled by other means (the
+  gRPC API after start) but `veloced` was not given `-multipath`, the syncer would read
+  per-path events as best paths and the last path would win. Use the flag.
+- **ECMP has no weights**, and uses one route per prefix with inline next hops, not
+  kernel next hop objects (`nhid`). At 900k prefixes the per-prefix state of the
+  syncer (paths, applied next hops) has not been measured (task E4-5).
 - **No next hop resolution** beyond what the kernel does (task E4-2). A next hop that is
   not on a connected network is skipped, not retried when a route to it appears later;
   it is installed when the next best path event for that prefix arrives.

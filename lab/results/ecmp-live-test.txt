@@ -1,0 +1,23 @@
+== start: empty lab tables, veloced -multipath replaces gobgpd on r2
+PASS  a prefix both routers advertise gets one route with both next hops
+PASS  it is a single kernel route, not two
+PASS  the route carries our protocol and metric
+PASS  a prefix only r1 advertises has one next hop
+PASS  a prefix only r3 advertises has one next hop
+PASS  r1 withdraws: the route shrinks to r3's next hop
+PASS  r1 advertises again: both next hops are back
+PASS  session to r3 goes down: the route shrinks to r1's next hop
+PASS  prefixes only r3 had are removed
+PASS  session to r3 comes back: both next hops again
+PASS  clean stop removes the ECMP routes too
+== without -multipath the same paths give one next hop
+PASS  single next hop when -multipath is off
+== crash recovery with an ECMP route
+PASS  kill -9 leaves the ECMP route (expected)
+PASS  the stale ECMP route is removed on the next start
+PASS  the kernel's own routes survive everything
+== restore: stop veloced, restart gobgpd on all routers
+Peer         AS  Up/Down State       |#Received  Accepted
+10.0.12.1 65001 00:00:08 Establ      |        0         0
+10.0.23.2 65003 00:00:07 Establ      |        0         0
+== 15 passed, 0 failed

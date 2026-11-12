@@ -11,7 +11,7 @@ Features:
 
 Early stage. The repository starts from upstream [osrg/gobgp](https://github.com/osrg/gobgp) v4.11.0 (commit `f7daa917`, remote `upstream`) and is being tuned for allocation and GC behavior under full-table imports before the new features are added. The original GoBGP README is kept in [README-GoBGP.md](README-GoBGP.md).
 
-**Not built yet:** the WireGuard engine and the Amazon VPC Route Server mode. Linux kernel route sync exists in a first form (`veloced -fib-sync`, one next hop per prefix, no ECMP; [docs/veloceroute/fib.md](docs/veloceroute/fib.md)). `veloced`, the single binary they will live in, exists as a skeleton ([docs/veloceroute/veloced.md](docs/veloceroute/veloced.md)): it runs the GoBGP engine and its gRPC API with ordered start and stop. Otherwise the code is upstream GoBGP plus performance work. The four features above are the target, and each is tracked as tasks in [ROADMAP.md](ROADMAP.md).
+**Not built yet:** the WireGuard engine and the Amazon VPC Route Server mode. Linux kernel route sync exists in a first form (`veloced -fib-sync`, with ECMP routes under `-multipath`; [docs/veloceroute/fib.md](docs/veloceroute/fib.md)). `veloced`, the single binary they will live in, exists as a skeleton ([docs/veloceroute/veloced.md](docs/veloceroute/veloced.md)): it runs the GoBGP engine and its gRPC API with ordered start and stop. Otherwise the code is upstream GoBGP plus performance work. The four features above are the target, and each is tracked as tasks in [ROADMAP.md](ROADMAP.md).
 
 ### Changes on top of upstream so far
 

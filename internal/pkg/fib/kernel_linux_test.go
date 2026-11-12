@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"slices"
 	"testing"
 
 	"github.com/osrg/gobgp/v4/pkg/apiutil"
@@ -125,6 +126,9 @@ func (n *testNS) programmer(t *testing.T) interface {
 	return p
 }
 
+// rt builds a route with the given next hops.
+func rt(p netip.Prefix, hops ...netip.Addr) Route { return Route{Prefix: p, NextHops: hops} }
+
 func pfx(s string) netip.Prefix { return netip.MustParsePrefix(s) }
 func ip(s string) netip.Addr    { return netip.MustParseAddr(s) }
 
@@ -132,7 +136,7 @@ func TestKernelInstallReplaceDelete(t *testing.T) {
 	n := newTestNS(t)
 	p := n.programmer(t)
 
-	if err := p.Replace(Route{pfx("192.0.2.0/24"), ip("10.0.12.2")}); err != nil {
+	if err := p.Replace(rt(pfx("192.0.2.0/24"), ip("10.0.12.2"))); err != nil {
 		t.Fatalf("install: %v", err)
 	}
 	rs := n.find(netlink.FAMILY_V4, "192.0.2.0/24")
@@ -145,7 +149,7 @@ func TestKernelInstallReplaceDelete(t *testing.T) {
 	}
 
 	// Replacing with another next hop leaves exactly one route.
-	if err := p.Replace(Route{pfx("192.0.2.0/24"), ip("10.0.12.3")}); err != nil {
+	if err := p.Replace(rt(pfx("192.0.2.0/24"), ip("10.0.12.3"))); err != nil {
 		t.Fatalf("replace: %v", err)
 	}
 	rs = n.find(netlink.FAMILY_V4, "192.0.2.0/24")
@@ -154,7 +158,7 @@ func TestKernelInstallReplaceDelete(t *testing.T) {
 	}
 
 	owned, err := p.ListOwned()
-	if err != nil || len(owned) != 1 || owned[0].Prefix != pfx("192.0.2.0/24") || owned[0].NextHop != ip("10.0.12.3") {
+	if err != nil || len(owned) != 1 || owned[0].Prefix != pfx("192.0.2.0/24") || !slices.Equal(owned[0].NextHops, []netip.Addr{ip("10.0.12.3")}) {
 		t.Fatalf("ListOwned = %v, %v", owned, err)
 	}
 
@@ -189,10 +193,10 @@ func TestKernelNeverTouchesForeignRoutes(t *testing.T) {
 	}
 
 	// Program the same prefix, and the connected prefix.
-	if err := p.Replace(Route{pfx("192.0.2.0/24"), ip("10.0.12.2")}); err != nil {
+	if err := p.Replace(rt(pfx("192.0.2.0/24"), ip("10.0.12.2"))); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Replace(Route{pfx("10.0.12.0/24"), ip("10.0.12.7")}); err != nil {
+	if err := p.Replace(rt(pfx("10.0.12.0/24"), ip("10.0.12.7"))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -249,7 +253,7 @@ func TestKernelNeverTouchesForeignRoutes(t *testing.T) {
 func TestKernelUnreachableNextHop(t *testing.T) {
 	n := newTestNS(t)
 	p := n.programmer(t)
-	err := p.Replace(Route{pfx("192.0.2.0/24"), ip("172.31.255.1")}) // no route to it
+	err := p.Replace(rt(pfx("192.0.2.0/24"), ip("172.31.255.1"))) // no route to it
 	if !errors.Is(err, ErrNextHopUnreachable) {
 		t.Fatalf("err = %v, want ErrNextHopUnreachable", err)
 	}
@@ -261,7 +265,7 @@ func TestKernelUnreachableNextHop(t *testing.T) {
 func TestKernelDefaultRoute(t *testing.T) {
 	n := newTestNS(t)
 	p := n.programmer(t)
-	if err := p.Replace(Route{pfx("0.0.0.0/0"), ip("10.0.12.2")}); err != nil {
+	if err := p.Replace(rt(pfx("0.0.0.0/0"), ip("10.0.12.2"))); err != nil {
 		t.Fatalf("default route: %v", err)
 	}
 	owned, err := p.ListOwned()
@@ -283,11 +287,11 @@ func TestKernelIPv6(t *testing.T) {
 		t.Skip("IPv6 is not available in this environment")
 	}
 	p := n.programmer(t)
-	if err := p.Replace(Route{pfx("2001:db8:99::/48"), ip("2001:db8:12::2")}); err != nil {
+	if err := p.Replace(rt(pfx("2001:db8:99::/48"), ip("2001:db8:12::2"))); err != nil {
 		t.Fatalf("v6 install: %v", err)
 	}
 	owned, err := p.ListOwned()
-	if err != nil || len(owned) != 1 || owned[0].Prefix != pfx("2001:db8:99::/48") || owned[0].NextHop != ip("2001:db8:12::2") {
+	if err != nil || len(owned) != 1 || owned[0].Prefix != pfx("2001:db8:99::/48") || !slices.Equal(owned[0].NextHops, []netip.Addr{ip("2001:db8:12::2")}) {
 		t.Fatalf("ListOwned = %v, %v", owned, err)
 	}
 	if err := p.Delete(pfx("2001:db8:99::/48")); err != nil {
@@ -321,7 +325,7 @@ func TestKernelSyncerEndToEnd(t *testing.T) {
 	p := n.programmer(t)
 
 	// A route our protocol left behind in an earlier run.
-	if err := p.Replace(Route{pfx("198.51.100.0/24"), ip("10.0.12.2")}); err != nil {
+	if err := p.Replace(rt(pfx("198.51.100.0/24"), ip("10.0.12.2"))); err != nil {
 		t.Fatal(err)
 	}
 	s := NewSyncer(p, quiet())
@@ -401,5 +405,179 @@ func TestKernelProgrammerOpensInCurrentNamespace(t *testing.T) {
 	defer p.Close()
 	if _, err := p.ListOwned(); err != nil {
 		t.Fatalf("ListOwned in the current namespace: %v", err)
+	}
+}
+
+// ---- ECMP (task E4-3) ----
+
+// gws returns the gateways of a listed route, whether it is a plain route or
+// a multipath one.
+func gws(r netlink.Route) []string {
+	var out []string
+	if len(r.MultiPath) > 0 {
+		for _, h := range r.MultiPath {
+			out = append(out, h.Gw.String())
+		}
+	} else if r.Gw != nil {
+		out = append(out, r.Gw.String())
+	}
+	slices.Sort(out)
+	return out
+}
+
+func ecmpLifecycle(t *testing.T, family int, prefix string, hops ...string) {
+	n := newTestNS(t)
+	if family == netlink.FAMILY_V6 {
+		v0, _ := n.h.LinkByName("v0")
+		if !n.addr(v0, "2001:db8:12::1/64") {
+			t.Skip("IPv6 is not available in this environment")
+		}
+	}
+	p := n.programmer(t)
+	addrs := func(hs ...string) []netip.Addr {
+		var out []netip.Addr
+		for _, h := range hs {
+			out = append(out, ip(h))
+		}
+		return out
+	}
+	expect := func(step string, want ...string) {
+		t.Helper()
+		rs := n.find(family, prefix)
+		if len(rs) != 1 {
+			t.Fatalf("%s: want one route for %s, have %d: %v", step, prefix, len(rs), rs)
+		}
+		if got := gws(rs[0]); !slices.Equal(got, want) {
+			t.Fatalf("%s: next hops %v, want %v", step, got, want)
+		}
+		if rs[0].Protocol != DefaultProtocol || rs[0].Priority != DefaultMetric {
+			t.Fatalf("%s: route is not marked as ours: proto %d metric %d", step, rs[0].Protocol, rs[0].Priority)
+		}
+		owned, err := p.ListOwned()
+		if err != nil || len(owned) != 1 || owned[0].Prefix != pfx(prefix) || !slices.Equal(owned[0].NextHops, addrs(want...)) {
+			t.Fatalf("%s: ListOwned = %v, %v", step, owned, err)
+		}
+	}
+
+	if err := p.Replace(rt(pfx(prefix), addrs(hops[:2]...)...)); err != nil {
+		t.Fatalf("install two next hops: %v", err)
+	}
+	expect("two next hops", hops[:2]...)
+	if err := p.Replace(rt(pfx(prefix), addrs(hops...)...)); err != nil {
+		t.Fatalf("grow to three: %v", err)
+	}
+	expect("three next hops", hops...)
+	if err := p.Replace(rt(pfx(prefix), addrs(hops[1:]...)...)); err != nil {
+		t.Fatalf("change the set: %v", err)
+	}
+	expect("changed set", hops[1:]...)
+	if err := p.Replace(rt(pfx(prefix), addrs(hops[2])...)); err != nil {
+		t.Fatalf("shrink to one: %v", err)
+	}
+	expect("one next hop", hops[2])
+	if err := p.Replace(rt(pfx(prefix), addrs(hops[:2]...)...)); err != nil {
+		t.Fatalf("grow again from a single route: %v", err)
+	}
+	expect("two next hops again", hops[:2]...)
+
+	if err := p.Delete(pfx(prefix)); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if rs := n.find(family, prefix); len(rs) != 0 {
+		t.Fatalf("delete left routes behind: %v", rs)
+	}
+	if owned, _ := p.ListOwned(); len(owned) != 0 {
+		t.Fatalf("ListOwned after delete: %v", owned)
+	}
+}
+
+func TestKernelEcmpIPv4(t *testing.T) {
+	ecmpLifecycle(t, netlink.FAMILY_V4, "192.0.2.0/24", "10.0.12.2", "10.0.12.3", "10.0.12.4")
+}
+
+func TestKernelEcmpIPv6(t *testing.T) {
+	ecmpLifecycle(t, netlink.FAMILY_V6, "2001:db8:99::/48", "2001:db8:12::2", "2001:db8:12::3", "2001:db8:12::4")
+}
+
+// The kernel refuses a multipath route if any next hop is unreachable, and the
+// route that was there stays as it was.
+func TestKernelEcmpUnreachableNextHopKeepsOldRoute(t *testing.T) {
+	n := newTestNS(t)
+	p := n.programmer(t)
+	if err := p.Replace(rt(pfx("192.0.2.0/24"), ip("10.0.12.2"), ip("10.0.12.3"))); err != nil {
+		t.Fatal(err)
+	}
+	err := p.Replace(rt(pfx("192.0.2.0/24"), ip("10.0.12.2"), ip("172.31.255.1")))
+	if !errors.Is(err, ErrNextHopUnreachable) {
+		t.Fatalf("err = %v, want ErrNextHopUnreachable", err)
+	}
+	rs := n.find(netlink.FAMILY_V4, "192.0.2.0/24")
+	if len(rs) != 1 || !slices.Equal(gws(rs[0]), []string{"10.0.12.2", "10.0.12.3"}) {
+		t.Fatalf("old route changed: %v", rs)
+	}
+}
+
+// Our ECMP route and someone else's route for the same prefix coexist, and
+// deleting ours leaves theirs.
+func TestKernelEcmpNeverTouchesForeignRoute(t *testing.T) {
+	n := newTestNS(t)
+	p := n.programmer(t)
+	static := &netlink.Route{Dst: ipNet(pfx("192.0.2.0/24")), Gw: net.ParseIP("10.0.12.9"), Table: unix.RT_TABLE_MAIN, Protocol: unix.RTPROT_STATIC}
+	if err := n.h.RouteAdd(static); err != nil {
+		t.Fatalf("add static route: %v", err)
+	}
+	if err := p.Replace(rt(pfx("192.0.2.0/24"), ip("10.0.12.2"), ip("10.0.12.3"))); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(n.find(netlink.FAMILY_V4, "192.0.2.0/24")); got != 2 {
+		t.Fatalf("want the static route and ours, have %d routes", got)
+	}
+	if err := p.Delete(pfx("192.0.2.0/24")); err != nil {
+		t.Fatal(err)
+	}
+	rs := n.find(netlink.FAMILY_V4, "192.0.2.0/24")
+	if len(rs) != 1 || rs[0].Protocol != unix.RTPROT_STATIC || !slices.Equal(gws(rs[0]), []string{"10.0.12.9"}) {
+		t.Fatalf("the static route did not survive: %v", rs)
+	}
+}
+
+// The syncer against a real kernel with ECMP: build, shrink, and the fallback
+// that leaves out an unreachable next hop.
+func TestKernelSyncerEcmpEndToEnd(t *testing.T) {
+	n := newTestNS(t)
+	p := n.programmer(t)
+	s := NewSyncer(p, quiet(), WithMultipath(0))
+	via := func(prefix, nh, peerAddr string) *apiutil.Path { return from(v4(t, prefix, nh), peerAddr) }
+
+	s.HandleBestPaths([]*apiutil.Path{
+		via("192.0.2.0/24", "10.0.12.2", "10.0.12.2"),
+		via("192.0.2.0/24", "10.0.12.3", "10.0.12.3"),
+		via("198.51.100.0/24", "10.0.12.2", "10.0.12.2"),
+		via("198.51.100.0/24", "172.31.255.1", "10.0.12.3"), // unreachable: left out
+		via("198.51.100.0/24", "10.0.12.4", "10.0.12.4"),
+	})
+	rs := n.find(netlink.FAMILY_V4, "192.0.2.0/24")
+	if len(rs) != 1 || !slices.Equal(gws(rs[0]), []string{"10.0.12.2", "10.0.12.3"}) {
+		t.Fatalf("192.0.2.0/24: %v", rs)
+	}
+	rs = n.find(netlink.FAMILY_V4, "198.51.100.0/24")
+	if len(rs) != 1 || !slices.Equal(gws(rs[0]), []string{"10.0.12.2", "10.0.12.4"}) {
+		t.Fatalf("198.51.100.0/24 should hold the two reachable next hops: %v", rs)
+	}
+	if st := s.Stats(); st.Installed != 2 || st.Unreachable != 1 || st.Errors != 0 {
+		t.Fatalf("stats %+v", st)
+	}
+
+	s.HandleBestPaths([]*apiutil.Path{withdrawn(via("192.0.2.0/24", "10.0.12.3", "10.0.12.3"))})
+	rs = n.find(netlink.FAMILY_V4, "192.0.2.0/24")
+	if len(rs) != 1 || !slices.Equal(gws(rs[0]), []string{"10.0.12.2"}) {
+		t.Fatalf("after one path left: %v", rs)
+	}
+
+	if err := s.RemoveAll(); err != nil {
+		t.Fatal(err)
+	}
+	if owned, _ := p.ListOwned(); len(owned) != 0 {
+		t.Fatalf("routes left after RemoveAll: %v", owned)
 	}
 }

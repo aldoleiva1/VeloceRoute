@@ -18,7 +18,7 @@ Status of the product features and the task areas. A task is **done** only when 
 | E1-1 encode `sync.Pool` | Mostly done | Append writer, exact buffers, pooled AS-path scratch. `NewBGPUpdateMessage` and the attribute-presence map are untouched | finish remaining 10 allocations |
 | Single static binary (`veloced`, E2) | Started | E2-1 skeleton: embeds GoBGP and its gRPC API, ordered start/stop, static build runs in the Alpine lab image; now with a `fib` stage. See `docs/veloceroute/veloced.md` | E2-2 config schema (needs A-4 decision), then E3-1 WireGuard stage |
 | gRPC API and OpenConfig | Upstream only | GoBGP's own API; no WireGuard or FIB additions | E7 after E3/E4 |
-| Linux Netlink kernel table sync (E4) | Started | E4-1 done: `veloced -fib-sync` programs best paths into the kernel, tested in a netns and live in the lab. See `docs/veloceroute/fib.md` | E4-3 ECMP, E4-2 nexthop resolution, E4-5 bulk |
+| Linux Netlink kernel table sync (E4) | Started | E4-1 and E4-3 done: `veloced -fib-sync` programs best paths into the kernel, and with `-multipath` builds ECMP routes; tested in a netns (IPv4 and IPv6) and live in the lab. See `docs/veloceroute/fib.md` | E4-2 nexthop resolution, E4-5 bulk, E4-6 CI |
 | WireGuard engine (E3) | Not started | none | E3-1 |
 | Amazon VPC Route Server peering (E5) | Not started | facts verified from docs only; no AWS test yet | E5-1 |
 | CI, lint, Linux test environment (A-2, A-5, A-6) | Not started | none | A-2 |
@@ -99,7 +99,7 @@ Baseline to beat (r2, 900k import, mean of 3, upstream): 193.8 mallocs/route, 8.
 |---|---|---|---|
 | E4-1 | **Done.** Netlink route programmer: subscribe to best-path changes (`WatchEvent`/`WatchBestPath`, ideally the E1-6 zero-copy path), add/replace/delete routes with `vishvananda/netlink` | Learned prefixes appear in `ip route` and are removed on withdraw | E2-1 |
 | E4-2 | **Partly done** (unreachable next hops are skipped and logged; no retry or interface binding yet). Nexthop resolution and interface binding (WG interface vs ENI); skip or defer unresolvable nexthops | Test with reachable and unreachable nexthops | E4-1 |
-| E4-3 | ECMP: program multipath routes when GoBGP has multiple best paths (lab anycast case) | `ip route` shows 2 nexthops for 192.0.2.1/32 | E4-1 |
+| E4-3 | **Done** (`-multipath`; per-source path set, one atomic replace per prefix, unreachable next hops left out; no weights; live test `lab/ecmp-demo.sh`). ECMP: program multipath routes when GoBGP has multiple best paths (lab anycast case) | `ip route` shows 2 nexthops for 192.0.2.1/32 | E4-1 |
 | E4-4 | **Mostly done** (own protocol id and metric, reconcile on start, cleanup on stop; dedicated table is a flag; crash test is `lab/fib-demo.sh`). Own the routes: tag with a dedicated routing protocol ID, optional dedicated table; reconcile on start (remove stale), clean up on exit | Crash and restart test leaves no stale routes | E4-1 |
 | E4-5 | Bulk programming performance: batching, avoid one syscall per route, measure with the 900k feed | Time and CPU to program N routes documented; no blocking of the BGP loop (single-writer rule, CLAUDE.md rule 3) | E4-1, E1-6 |
 | E4-6 | Tests in a Linux network namespace (CI-capable) | Netns test suite runs in CI | A-6, E4-1 |

@@ -32,6 +32,7 @@ BGP's own port is 179, which needs root or `CAP_NET_BIND_SERVICE`; use
 | `-log-format` | text | text or json |
 | `-version` | | print the version and exit |
 | `-fib-sync`, `-fib-protocol`, `-fib-table`, `-fib-metric` | off, 201, 254, 20 | kernel route sync (Linux, needs `CAP_NET_ADMIN`); see [fib.md](fib.md) |
+| `-multipath`, `-fib-max-paths` | off, 64 | keep every equal-cost path; with `-fib-sync` build ECMP kernel routes (at most N next hops); see [fib.md](fib.md) |
 
 Invalid flags exit with status 2 and a message listing every problem. A real
 config file (global BGP, neighbors, WireGuard, kernel sync, AWS) is task E2-2.

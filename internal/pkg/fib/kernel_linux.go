@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
@@ -116,8 +117,19 @@ func (k *kernelProgrammer) route(p netip.Prefix) *netlink.Route {
 }
 
 func (k *kernelProgrammer) Replace(r Route) error {
+	if len(r.NextHops) == 0 {
+		return errors.New("route has no next hop")
+	}
 	nl := k.route(r.Prefix)
-	nl.Gw = net.IP(r.NextHop.AsSlice())
+	if len(r.NextHops) == 1 {
+		nl.Gw = net.IP(r.NextHops[0].AsSlice())
+	} else {
+		// ECMP: one route with several next hops, replaced as a whole so the
+		// kernel never forwards over a half-updated set.
+		for _, h := range r.NextHops {
+			nl.MultiPath = append(nl.MultiPath, &netlink.NexthopInfo{Gw: net.IP(h.AsSlice())})
+		}
+	}
 	if err := k.h.RouteReplace(nl); err != nil {
 		if errors.Is(err, unix.ENETUNREACH) {
 			return fmt.Errorf("%w: %v", ErrNextHopUnreachable, err)
@@ -150,8 +162,18 @@ func (k *kernelProgrammer) ListOwned() ([]Route, error) {
 		if !ok {
 			continue
 		}
-		nh, _ := netip.AddrFromSlice(r.Gw)
-		out = append(out, Route{Prefix: p, NextHop: nh.Unmap()})
+		var hops []netip.Addr
+		if len(r.MultiPath) > 0 {
+			for _, n := range r.MultiPath {
+				if a, ok := netip.AddrFromSlice(n.Gw); ok {
+					hops = append(hops, a.Unmap())
+				}
+			}
+		} else if a, ok := netip.AddrFromSlice(r.Gw); ok {
+			hops = append(hops, a.Unmap())
+		}
+		slices.SortFunc(hops, netip.Addr.Compare)
+		out = append(out, Route{Prefix: p, NextHops: hops})
 	}
 	return out, nil
 }

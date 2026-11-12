@@ -39,11 +39,16 @@ type config struct {
 	LogFormat  string
 	Version    bool
 
+	// Multipath makes BGP keep every equal-cost path (use-multiple-paths) so
+	// kernel sync can build ECMP routes (task E4-3).
+	Multipath bool
+
 	// Linux kernel route sync (task E4-1).
 	FibSync     bool
 	FibProtocol int // rtnetlink protocol id stamped on our routes
 	FibTable    int // routing table to program
 	FibMetric   int // route priority; see fib.KernelOptions.Metric
+	FibMaxPaths int // most next hops in one ECMP route (with -multipath)
 }
 
 func parseFlags(args []string, errOut io.Writer) (*config, error) {
@@ -61,6 +66,8 @@ func parseFlags(args []string, errOut io.Writer) (*config, error) {
 	fs.IntVar(&c.FibProtocol, "fib-protocol", fib.DefaultProtocol, "route protocol id that marks the routes veloced owns (5 to 255)")
 	fs.IntVar(&c.FibTable, "fib-table", fib.DefaultTable, "routing table to program (254 is the main table)")
 	fs.IntVar(&c.FibMetric, "fib-metric", fib.DefaultMetric, "route metric; kept non-zero so a BGP route cannot replace a connected or static one")
+	fs.BoolVar(&c.Multipath, "multipath", false, "keep every equal-cost BGP path; with -fib-sync the kernel route gets all their next hops (ECMP)")
+	fs.IntVar(&c.FibMaxPaths, "fib-max-paths", fib.DefaultMaxNextHops, "most next hops in one ECMP kernel route (with -multipath and -fib-sync)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -110,6 +117,9 @@ func (c *config) validate() error {
 		}
 		if c.FibMetric < 1 {
 			errs = append(errs, fmt.Errorf("-fib-metric %d must be at least 1", c.FibMetric))
+		}
+		if c.FibMaxPaths < 1 {
+			errs = append(errs, fmt.Errorf("-fib-max-paths %d must be at least 1", c.FibMaxPaths))
 		}
 	}
 	return errors.Join(errs...)

@@ -74,9 +74,10 @@ func bgpStage(cfg *config, logger *slog.Logger, lvl *slog.LevelVar, d *daemon) s
 			go bgp.Serve()
 			return bgp.StartBgp(ctx, &api.StartBgpRequest{
 				Global: &api.Global{
-					Asn:        cfg.ASN,
-					RouterId:   cfg.RouterID,
-					ListenPort: cfg.ListenPort,
+					Asn:              cfg.ASN,
+					RouterId:         cfg.RouterID,
+					ListenPort:       cfg.ListenPort,
+					UseMultiplePaths: cfg.Multipath,
 				},
 			})
 		},
@@ -133,7 +134,13 @@ func fibStage(cfg *config, logger *slog.Logger, d *daemon, k kernelRoutes) stage
 			if err != nil {
 				return err
 			}
-			syn = fib.NewSyncer(prog, logger)
+			// Events carry every equal-cost path only when BGP keeps them, so
+			// the syncer must be told which kind of event stream it gets.
+			var opts []fib.Option
+			if cfg.Multipath {
+				opts = append(opts, fib.WithMultipath(cfg.FibMaxPaths))
+			}
+			syn = fib.NewSyncer(prog, logger, opts...)
 			// No session is up yet, so any route of ours already in the kernel
 			// is left over from an earlier run and is not valid.
 			if err := syn.Reconcile(); err != nil {
@@ -150,7 +157,8 @@ func fibStage(cfg *config, logger *slog.Logger, d *daemon, k kernelRoutes) stage
 				return err
 			}
 			logger.Info("kernel route sync on",
-				slog.Int("protocol", cfg.FibProtocol), slog.Int("table", cfg.FibTable), slog.Int("metric", cfg.FibMetric))
+				slog.Int("protocol", cfg.FibProtocol), slog.Int("table", cfg.FibTable), slog.Int("metric", cfg.FibMetric),
+				slog.Bool("ecmp", cfg.Multipath), slog.Int("max_paths", cfg.FibMaxPaths))
 			return nil
 		},
 		stop: func(context.Context) error {
