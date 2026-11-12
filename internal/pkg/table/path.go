@@ -662,6 +662,19 @@ func (n Nexthops) list() []netip.Addr {
 	return l
 }
 
+// ForwardingNexthop is the address traffic for path should be sent to: the
+// global next hop, or the link-local one when the global one is missing or
+// unspecified (a peer with no global address on the link). It is invalid when
+// path has no next hop information, such as a withdrawal. It reads the path
+// without allocating.
+func (path *Path) ForwardingNexthop() netip.Addr {
+	n := path.nexthops()
+	if n.global.IsValid() && !n.global.IsUnspecified() {
+		return n.global
+	}
+	return n.linkLocal
+}
+
 // nexthops returns the next hops of path as they are stored. Unlike
 // GetNexthop, it does not pick the link-local next hop when the global
 // one is unspecified.

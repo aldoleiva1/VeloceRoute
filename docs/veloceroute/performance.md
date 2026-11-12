@@ -376,5 +376,30 @@ Tracked in [`ROADMAP.md`](../../ROADMAP.md):
   options slice and small per-attribute buffers.
 - Remaining table-layer sites listed under change 6 (E1-3 is partly done).
 - (done in E2-5) `veloced` chooses `GOGC`/`GOMEMLIMIT` defaults from the instance memory.
-- Zero-copy `WatchEvent()` for local consumers, proto first (E1-6).
+- (done in E1-6) compact watch events for local consumers, see below.
 - Decoupling the Peer FSM loop (E1-7), the riskiest item, last.
+
+## Compact watch events for local consumers (E1-6)
+
+`WatchEvent` callbacks hand out `apiutil.Path` values: every path is cloned in the BGP loop
+and then turned into an attribute list and an API path in the watcher goroutine. That is
+fine for the gRPC stream, which needs that form anyway, but a consumer in the same process
+(kernel route sync) only reads a few fields. `server.WatchBestPathChanges(current)` with
+the callback `OnBestPathChange func([]server.BestPathChange, time.Time)` gives it those
+fields directly: family, NLRI, forwarding next hop (the link-local one when that is all the
+peer sent), peer address, path identifier, and the withdrawal and invalid-next-hop flags.
+
+- **Same events as `WatchBestPath`.** The update and withdraw deltas (withdrawals first),
+  else all multipaths, else the best paths, and with `current` the same snapshot. A test
+  runs 300 random adds, replacements and withdrawals through both kinds of watcher and
+  compares every event; another pins the selection and order rules.
+- **Nothing is cloned when only compact watchers exist.** `notifyBestWatcher` builds the
+  compact event first, and the full one only if a `WatchBestPath` watcher exists too.
+  `BenchmarkNotifyBestWatcher`: no watcher 0 allocations, compact 2 (138 B), full 7 (469 B).
+- **No `.proto` change.** The tracker item mentioned the protobuf pipeline, but in-process
+  watchers never marshalled protobuf: the cost was the path copies and the API path
+  conversion. The gRPC API is unchanged, so there was nothing to regenerate.
+- **Result for kernel sync at 900k routes:** CPU 8.2-9.2 s to 7.4-7.8 s (-13%), peak
+  memory 1.07-1.14 GB to 1.00-1.01 GB (-9%); see [fib.md](fib.md).
+- `table.Path.ForwardingNexthop` is the small accessor behind it: global next hop, or the
+  link-local one when the global one is missing or unspecified; it does not allocate.

@@ -236,3 +236,152 @@ func TestWatchMultipathBuildsAndShrinksEcmpRoute(t *testing.T) {
 	}
 	waitFor(t, "the route to be removed", want(""))
 }
+
+// The compact event and the API path are two spellings of the same facts, and
+// classify must decide the same for both.
+func TestClassifyChangeMatchesClassify(t *testing.T) {
+	v4n, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("192.0.2.0/24"))
+	v6n, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("2001:db8::/32"))
+	evpn := bgp.NewEVPNEthernetAutoDiscoveryRoute(nil, bgp.EthernetSegmentIdentifier{}, 0, 0)
+	hops := []string{"", "0.0.0.0", "::", "10.0.0.1", "2001:db8::1", "fe80::1"}
+	peers := []netip.Addr{{}, netip.MustParseAddr("10.0.0.2"), netip.MustParseAddr("fe80::2%eth1"), netip.MustParseAddr("fe80::2")}
+	n := 0
+	for _, fam := range []bgp.Family{bgp.RF_IPv4_UC, bgp.RF_IPv6_UC, bgp.RF_EVPN} {
+		for _, nlri := range []bgp.NLRI{v4n, v6n, evpn, nil} {
+			for _, h := range hops {
+				for _, pr := range peers {
+					for _, wd := range []bool{false, true} {
+						for _, bad := range []bool{false, true} {
+							nh := netip.Addr{}
+							var attrs []bgp.PathAttributeInterface
+							if h != "" {
+								nh = netip.MustParseAddr(h)
+								if nh.Is4() {
+									a, _ := bgp.NewPathAttributeNextHop(nh)
+									attrs = append(attrs, a)
+								} else {
+									attrs = append(attrs, &bgp.PathAttributeMpReachNLRI{Nexthop: nh})
+								}
+							}
+							p := &apiutil.Path{Family: fam, Nlri: nlri, Attrs: attrs, PeerAddress: pr, Withdrawal: wd, IsNexthopInvalid: bad}
+							c := &server.BestPathChange{Family: fam, Nlri: nlri, NextHop: nh, PeerAddress: pr, Withdrawal: wd, IsNexthopInvalid: bad}
+							pa, na, da := classify(p)
+							pb, nb, db := classifyChange(c)
+							if pa != pb || na != nb || da != db {
+								t.Fatalf("%+v: classify %v %v %v, classifyChange %v %v %v", c, pa, na, da, pb, nb, db)
+							}
+							ea, eb := makeEvent(p), makeChangeEvent(c)
+							if ea != eb {
+								t.Fatalf("%+v: makeEvent %+v, makeChangeEvent %+v", c, ea, eb)
+							}
+							n++
+						}
+					}
+				}
+			}
+		}
+	}
+	t.Logf("%d combinations", n)
+}
+
+// Two syncers watch the same server, one through the API paths and one
+// through the compact events (with multiple paths, so the delta, withdraw and
+// peer-down cases happen). Their tables must be the same at every step.
+func TestCompactEventsGiveTheSameTableAsApiPaths(t *testing.T) {
+	if l, err := net.Listen("tcp", "127.0.0.2:0"); err != nil {
+		t.Skipf("127.0.0.2 is not available for a second peer address: %v", err)
+	} else {
+		l.Close()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	bPort := freeTCPPort(t)
+	a1, a2, b := server.NewBgpServer(), server.NewBgpServer(), server.NewBgpServer()
+	go a1.Serve()
+	go a2.Serve()
+	go b.Serve()
+	defer a1.Stop()
+	defer b.Stop()
+	for _, a := range []struct {
+		s   *server.BgpServer
+		asn uint32
+		id  string
+	}{{a1, 65001, "1.1.1.1"}, {a2, 65003, "3.3.3.3"}} {
+		if err := a.s.StartBgp(ctx, &api.StartBgpRequest{Global: &api.Global{Asn: a.asn, RouterId: a.id, ListenPort: -1}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := b.StartBgp(ctx, &api.StartBgpRequest{Global: &api.Global{
+		Asn: 65002, RouterId: "2.2.2.2", ListenPort: int32(bPort), ListenAddresses: []string{"127.0.0.1"}, UseMultiplePaths: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	fNew, fOld := newFake(), newFake()
+	synNew := NewSyncer(fNew, quiet(), WithMultipath(0))
+	synOld := NewSyncer(fOld, quiet(), WithMultipath(0))
+	if err := synNew.Watch(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	// The older way: full paths converted to API paths.
+	go synOld.drain(ctx)
+	if err := b.WatchEvent(ctx, server.WatchEventMessageCallbacks{
+		OnBestPath: func(paths []*apiutil.Path, _ time.Time) { synOld.Submit(paths) },
+	}, server.WatchBestPath(true)); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, p := range []struct {
+		addr string
+		asn  uint32
+	}{{"127.0.0.1", 65001}, {"127.0.0.2", 65003}} {
+		if err := b.AddPeer(ctx, &api.AddPeerRequest{Peer: &api.Peer{
+			Conf:      &api.PeerConf{NeighborAddress: p.addr, PeerAsn: p.asn},
+			Transport: &api.Transport{PassiveMode: true},
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, a := range []struct {
+		s     *server.BgpServer
+		local string
+	}{{a1, "127.0.0.1"}, {a2, "127.0.0.2"}} {
+		if err := a.s.AddPeer(ctx, &api.AddPeerRequest{Peer: &api.Peer{
+			Conf:      &api.PeerConf{NeighborAddress: "127.0.0.1", PeerAsn: 65002},
+			Transport: &api.Transport{RemotePort: bPort, LocalAddress: a.local},
+			Timers:    &api.Timers{Config: &api.TimersConfig{ConnectRetry: 1}},
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	same := func(what string, want string) {
+		t.Helper()
+		waitFor(t, what, func() bool { return fNew.routes() == want && fOld.routes() == want })
+	}
+	add := func(s *server.BgpServer, prefix, nh string) {
+		t.Helper()
+		if _, err := s.AddPath(localPath(t, prefix, nh)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	del := func(s *server.BgpServer, prefix, nh string) {
+		t.Helper()
+		if err := s.DeletePath(apiutil.DeletePathRequest{Paths: localPath(t, prefix, nh).Paths}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add(a1, "192.0.2.0/24", "10.99.0.1")
+	add(a2, "192.0.2.0/24", "10.99.0.3")
+	add(a1, "198.51.100.0/24", "10.99.0.1")
+	same("both paths in both tables", "192.0.2.0/24>10.99.0.1+10.99.0.3,198.51.100.0/24>10.99.0.1")
+	del(a1, "192.0.2.0/24", "10.99.0.1")
+	same("one path withdrawn", "192.0.2.0/24>10.99.0.3,198.51.100.0/24>10.99.0.1")
+	add(a2, "198.51.100.0/24", "10.99.0.3")
+	same("a second path for the other prefix", "192.0.2.0/24>10.99.0.3,198.51.100.0/24>10.99.0.1+10.99.0.3")
+	a2.Stop()
+	same("peer down", "198.51.100.0/24>10.99.0.1")
+	del(a1, "198.51.100.0/24", "10.99.0.1")
+	same("everything withdrawn", "")
+}

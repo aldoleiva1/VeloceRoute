@@ -960,8 +960,12 @@ func (s *BgpServer) notifyBestWatcher(best []*table.Path, multipath [][]*table.P
 		// Note: If best path selection disabled, no best path to notify.
 		return
 	}
+	compact := s.isWatched(watchEventTypeBestPathChange)
+	if compact {
+		s.notifyWatcher(watchEventTypeBestPathChange, newBestPathChangeEvent(best, multipath, multipathUpdate, multipathWithdraw))
+	}
 	if !s.isWatched(watchEventTypeBestPath) {
-		// Nobody is listening: do not clone the paths or build the event.
+		// Nobody wants the full paths: do not clone them or build the event.
 		return
 	}
 	m := make(map[uint32]bool)
@@ -5477,8 +5481,11 @@ func toPathApiUtil(path *table.Path) *apiutil.Path {
 type WatchEventMessageCallbacks struct {
 	OnPathUpdate func([]*apiutil.Path, time.Time)
 	OnBestPath   func([]*apiutil.Path, time.Time)
-	OnPathEor    func(*apiutil.Path, time.Time)
-	OnPeerUpdate func(*apiutil.WatchEventMessage_PeerEvent, time.Time)
+	// OnBestPathChange gets best path changes in the compact form of
+	// BestPathChange; see WatchBestPathChanges.
+	OnBestPathChange func([]BestPathChange, time.Time)
+	OnPathEor        func(*apiutil.Path, time.Time)
+	OnPeerUpdate     func(*apiutil.WatchEventMessage_PeerEvent, time.Time)
 }
 
 func (s *BgpServer) WatchEvent(ctx context.Context, callbacks WatchEventMessageCallbacks, opts ...WatchOption) error {
@@ -5531,6 +5538,11 @@ func (s *BgpServer) watchEventQueued(ctx context.Context, callbacks WatchEventMe
 							callbacks.OnBestPath(p, msg.Timestamp)
 						}
 						callback(locRIBPathsForBMP(msg))
+					}
+
+				case *watchEventBestPathChange:
+					if callbacks.OnBestPathChange != nil {
+						callbacks.OnBestPathChange(msg.Changes, msg.Timestamp)
 					}
 
 				case *watchEventEor:
@@ -5636,13 +5648,14 @@ func (s *BgpServer) Log() *slog.Logger {
 type watchEventType string
 
 const (
-	watchEventTypeBestPath      watchEventType = "bestpath"
-	watchEventTypePreUpdate     watchEventType = "preupdate"
-	watchEventTypePostUpdate    watchEventType = "postupdate"
-	watchEventTypeAdjInWithdraw watchEventType = "adjinwithdraw"
-	watchEventTypePeerState     watchEventType = "peerstate"
-	watchEventTypeRecvMsg       watchEventType = "receivedmessage"
-	watchEventTypeEor           watchEventType = "eor"
+	watchEventTypeBestPath       watchEventType = "bestpath"
+	watchEventTypeBestPathChange watchEventType = "bestpathchange"
+	watchEventTypePreUpdate      watchEventType = "preupdate"
+	watchEventTypePostUpdate     watchEventType = "postupdate"
+	watchEventTypeAdjInWithdraw  watchEventType = "adjinwithdraw"
+	watchEventTypePeerState      watchEventType = "peerstate"
+	watchEventTypeRecvMsg        watchEventType = "receivedmessage"
+	watchEventTypeEor            watchEventType = "eor"
 )
 
 type watchEvent any
@@ -5696,6 +5709,97 @@ type watchEventBestPath struct {
 	Timestamp        time.Time
 }
 
+// BestPathChange is one best path change in the compact form a consumer in
+// the same process wants: just what it takes to decide what to do with a
+// route, with nothing shared with the BGP engine that could change under it
+// (the NLRI is never modified). Unlike the Path of OnBestPath, it takes no
+// attribute list and no path copy to make.
+type BestPathChange struct {
+	Family bgp.Family
+	// Nlri is the destination; for IPv4 and IPv6 unicast it is a
+	// *bgp.IPAddrPrefix.
+	Nlri bgp.NLRI
+	// NextHop is the address to forward to (the link-local one when that is
+	// all the peer sent). It is invalid for a withdrawal.
+	NextHop netip.Addr
+	// PeerAddress is the address of the peer the path came from, with the
+	// interface as zone for a link-local session. It is invalid for a path
+	// that did not come from a peer.
+	PeerAddress netip.Addr
+	// RemoteID is the path identifier the peer sent (ADD-PATH).
+	RemoteID uint32
+	// Withdrawal is true when the path is gone, false when it is new or
+	// still best.
+	Withdrawal bool
+	// IsNexthopInvalid is set when the next hop could not be resolved.
+	IsNexthopInvalid bool
+}
+
+// watchEventBestPathChange is the event of WatchBestPathChanges. It is built
+// once and shared by all its watchers, who must not change it.
+type watchEventBestPathChange struct {
+	Changes   []BestPathChange
+	Timestamp time.Time
+}
+
+// newBestPathChangeEvent summarizes a best path notification without keeping
+// any of the paths: they are read here, in the BGP loop, so nothing can change
+// them meanwhile. Which paths are reported follows locRIBPathsForBMP: the
+// update and withdraw deltas if there are any, else all the multipaths, else
+// the best paths.
+func newBestPathChangeEvent(best []*table.Path, multipath [][]*table.Path, update, withdraw []*table.Path) *watchEventBestPathChange {
+	var n int
+	deltas := len(update) > 0 || len(withdraw) > 0
+	switch {
+	case deltas:
+		n = len(withdraw) + len(update)
+	case len(multipath) > 0:
+		for _, l := range multipath {
+			n += len(l)
+		}
+	default:
+		n = len(best)
+	}
+	ev := &watchEventBestPathChange{
+		Changes:   make([]BestPathChange, 0, n),
+		Timestamp: time.Now(),
+	}
+	add := func(l []*table.Path) {
+		for _, p := range l {
+			if p != nil {
+				ev.Changes = append(ev.Changes, newBestPathChange(p))
+			}
+		}
+	}
+	switch {
+	case deltas:
+		add(withdraw)
+		add(update)
+	case len(multipath) > 0:
+		for _, l := range multipath {
+			add(l)
+		}
+	default:
+		add(best)
+	}
+	return ev
+}
+
+func newBestPathChange(p *table.Path) BestPathChange {
+	c := BestPathChange{
+		Family:           p.GetFamily(),
+		Nlri:             p.GetNlri(),
+		NextHop:          p.ForwardingNexthop(),
+		RemoteID:         p.RemoteID(),
+		Withdrawal:       p.IsWithdraw,
+		IsNexthopInvalid: p.IsNexthopInvalid,
+	}
+	if src := p.GetSource(); src != nil {
+		c.PeerAddress = src.Address
+	}
+	return c
+}
+
 func locRIBPathsForBMP(msg *watchEventBestPath) []*table.Path {
 	// Prefer update/withdraw delta when present.
 	if len(msg.UpdatePathList) > 0 || len(msg.WithdrawPathList) > 0 {
@@ -5738,6 +5842,8 @@ type watchEventEor struct {
 
 type watchOptions struct {
 	bestPath         bool
+	bestPathChange   bool
+	initBestChange   bool
 	preUpdate        bool
 	preUpdateFilter  func(w watchEvent) bool
 	postUpdate       bool
@@ -5761,6 +5867,21 @@ func WatchBestPath(current bool) WatchOption {
 		o.bestPath = true
 		if current {
 			o.initBest = true
+		}
+	}
+}
+
+// WatchBestPathChanges watches best path changes in the compact form of
+// BestPathChange, delivered to WatchEventMessageCallbacks.OnBestPathChange. It
+// is the cheap way for a consumer in the same process: unlike WatchBestPath, no
+// path is cloned, no attribute list or API path is built, and nothing is
+// copied that the consumer does not read. With current, the current best paths
+// are delivered first.
+func WatchBestPathChanges(current bool) WatchOption {
+	return func(o *watchOptions) {
+		o.bestPathChange = true
+		if current {
+			o.initBestChange = true
 		}
 	}
 }
@@ -5993,6 +6114,12 @@ func (s *BgpServer) watch(opts ...WatchOption) (*watcher, error) {
 				Timestamp:     time.Now(),
 			})
 		}
+		if w.opts.initBestChange && s.active() == nil {
+			w.notify(newBestPathChangeEvent(
+				s.globalRib.GetBestPathList(table.GLOBAL_RIB_NAME, 0, nil),
+				s.globalRib.GetBestMultiPathList(table.GLOBAL_RIB_NAME, nil),
+				nil, nil))
+		}
 		if w.opts.initEor && s.active() == nil {
 			now := time.Now()
 			for _, p := range s.neighborMap {
@@ -6113,6 +6240,9 @@ func (s *BgpServer) watch(opts ...WatchOption) (*watcher, error) {
 					})
 				}
 			}
+		}
+		if w.opts.bestPathChange {
+			register(watchEventTypeBestPathChange, w)
 		}
 		if w.opts.bestPath {
 			register(watchEventTypeBestPath, w)

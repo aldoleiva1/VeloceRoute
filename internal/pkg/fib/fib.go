@@ -37,6 +37,7 @@ import (
 
 	"github.com/osrg/gobgp/v4/pkg/apiutil"
 	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
+	"github.com/osrg/gobgp/v4/pkg/server"
 )
 
 // Route is what gets programmed: a prefix and the gateways to reach it. One
@@ -355,6 +356,32 @@ func makeEvent(p *apiutil.Path) event {
 		return event{disp: dispIgnore}
 	}
 	return event{prefix: prefix, src: source{peer: p.PeerAddress, id: p.RemoteID}, nh: nh, disp: disp, withdrawal: p.Withdrawal}
+}
+
+// makeChangeEvent is makeEvent for the compact server event.
+func makeChangeEvent(c *server.BestPathChange) event {
+	prefix, nh, disp := classifyChange(c)
+	if disp == dispIgnore {
+		return event{disp: dispIgnore}
+	}
+	return event{prefix: prefix, src: source{peer: c.PeerAddress, id: c.RemoteID}, nh: nh, disp: disp, withdrawal: c.Withdrawal}
+}
+
+// SubmitChanges is Submit for the compact events of
+// server.WatchBestPathChanges, which take no path copies or attribute lists.
+func (s *Syncer) SubmitChanges(changes []server.BestPathChange) {
+	s.qmu.Lock()
+	for i := range changes {
+		s.queue = append(s.queue, makeChangeEvent(&changes[i]))
+	}
+	if len(s.queue) > s.qpeak {
+		s.qpeak = len(s.queue)
+	}
+	s.qmu.Unlock()
+	select {
+	case s.qwake <- struct{}{}:
+	default:
+	}
 }
 
 // HandleBestPaths applies one best path event.
@@ -796,10 +823,21 @@ func classify(p *apiutil.Path) (netip.Prefix, netip.Addr, disposition) {
 	if p == nil {
 		return netip.Prefix{}, netip.Addr{}, dispIgnore
 	}
+	return classifyParts(p.Family, p.Nlri, p.Withdrawal, p.PeerAddress, p.IsNexthopInvalid, func() netip.Addr { return nextHopOf(p) })
+}
+
+// classifyChange is classify for the compact event of the server package.
+func classifyChange(c *server.BestPathChange) (netip.Prefix, netip.Addr, disposition) {
+	return classifyParts(c.Family, c.Nlri, c.Withdrawal, c.PeerAddress, c.IsNexthopInvalid, func() netip.Addr { return c.NextHop })
+}
+
+// classifyParts is the one place the rules above are written down. nextHop is
+// only called for a path that could be programmed.
+func classifyParts(family bgp.Family, nlri bgp.NLRI, withdrawal bool, peer netip.Addr, nhInvalid bool, nextHop func() netip.Addr) (netip.Prefix, netip.Addr, disposition) {
 	var prefix netip.Prefix
-	switch p.Family {
+	switch family {
 	case bgp.RF_IPv4_UC, bgp.RF_IPv6_UC:
-		n, ok := p.Nlri.(*bgp.IPAddrPrefix)
+		n, ok := nlri.(*bgp.IPAddrPrefix)
 		if !ok {
 			return netip.Prefix{}, netip.Addr{}, dispIgnore
 		}
@@ -807,10 +845,10 @@ func classify(p *apiutil.Path) (netip.Prefix, netip.Addr, disposition) {
 	default:
 		return netip.Prefix{}, netip.Addr{}, dispIgnore
 	}
-	if p.Withdrawal || !p.PeerAddress.IsValid() || p.IsNexthopInvalid {
+	if withdrawal || !peer.IsValid() || nhInvalid {
 		return prefix, netip.Addr{}, dispRemove
 	}
-	nh := nextHopOf(p)
+	nh := nextHop()
 	if !nh.IsValid() || nh.IsUnspecified() || nh.Is4() != prefix.Addr().Is4() {
 		// For example an IPv4 prefix with an IPv6 next hop needs a
 		// different kernel encoding; not supported yet.
@@ -821,7 +859,7 @@ func classify(p *apiutil.Path) (netip.Prefix, netip.Addr, disposition) {
 		// refuses it), and the only place the interface is known is the
 		// peer's address: GoBGP gives a peer reached over a link-local address
 		// a zone.
-		zone := p.PeerAddress.Zone()
+		zone := peer.Zone()
 		if zone == "" {
 			return prefix, nh, dispNoInterface
 		}

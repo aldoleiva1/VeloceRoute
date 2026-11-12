@@ -99,14 +99,36 @@ environment settings gave 8.9-10.1 s CPU and 1.13-1.32 GB, the same as the `GOGC
 **Where the time goes now** (CPU profile of one batched import, 12.1 s of samples,
 `lab/results/prof/fibbatch_*`; `-pprof-address` makes this repeatable): garbage collection
 is 54% of the CPU. The syncer's own work (`drain`) is 16%, and only 0.9 s of it is the
-kernel call (`Apply`), mostly kernel time inserting routes. In the BGP loop, preparing
-events for the watcher (`notifyBestWatcher`, cloning paths) costs 0.44 s, and turning them
-into API paths in the watcher goroutine 0.31 s. That cloning is why BGP converges about
-0.7 s (12%) later than the control: the kernel write no longer blocks BGP, but producing
-the events still does a little. Removing it needs zero-copy watch events (task E1-6).
+kernel call (`Apply`), mostly kernel time inserting routes. In that profile (before
+E1-6), preparing events for the watcher in the BGP loop (`notifyBestWatcher`, cloning paths)
+cost 0.44 s, and turning them into API paths in the watcher goroutine 0.31 s. Both are gone
+with the compact watch events of E1-6: see the next section.
 Live memory after the import: our per-prefix state is 168 MB (about 190 bytes per prefix:
 the map slot plus a candidate and the applied next hops); the rest of the 0.43 GB over the
 control is garbage waiting for the collector.
+
+**Compact watch events (E1-6).** `Watch` now uses `server.WatchBestPathChanges` instead of
+`WatchBestPath`. The old event carried clones of the paths (and the watcher goroutine then
+built an attribute list and an `apiutil.Path` for each one), although the syncer only
+needs the prefix, the next hop, the peer and whether the path was withdrawn. The new event
+is a slice of `server.BestPathChange` values with just those fields, filled in the BGP loop
+straight from the paths (so nothing is shared that could change meanwhile). With only
+compact watchers there are no path clones, no vrf map and no attribute lists; gRPC
+watchers and BMP use the old event as before, and if both kinds exist both are built.
+Per event in the BGP loop (`BenchmarkNotifyBestWatcher`, one path): 7 allocations and
+469 B before, 2 allocations and 138 B now. At 900k routes (`-share 40`, n=3, interleaved,
+`lab/results/zc-*`):
+
+| | BGP converged | kernel table complete | veloced CPU | peak memory |
+|---|---|---|---|---|
+| before (full paths) | 6.35-6.56 s | same moment as BGP | 8.2-9.2 s | 1.07-1.14 GB |
+| compact events | 6.31-6.37 s | same moment as BGP | 7.4-7.8 s | 1.00-1.01 GB |
+| control: no kernel sync | 5.87-6.24 s | n/a | 3.5-3.9 s | 0.56-0.57 GB |
+
+CPU is 13% lower and memory 9% lower. BGP now converges 0.1-0.5 s after the control
+instead of about 0.7 s (the ranges overlap: this laptop varies by that much from run to
+run, so treat the remaining gap as small, not zero). The rest of the gap to the control is
+the syncer's own work and the extra garbage it makes.
 
 **The kernel side alone at 900k** (`FIB_SCALE_N=900000 /fib.test -test.run TestKernelScale`,
 real kernel, events of 40 paths): install 1.9 s (22,500 batches), list all our routes

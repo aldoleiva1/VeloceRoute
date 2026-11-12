@@ -18,7 +18,6 @@ import (
 	"context"
 	"time"
 
-	"github.com/osrg/gobgp/v4/pkg/apiutil"
 	"github.com/osrg/gobgp/v4/pkg/server"
 )
 
@@ -32,6 +31,6 @@ import (
 func (s *Syncer) Watch(ctx context.Context, bgp *server.BgpServer) error {
 	go s.drain(ctx)
 	return bgp.WatchEvent(ctx, server.WatchEventMessageCallbacks{
-		OnBestPath: func(paths []*apiutil.Path, _ time.Time) { s.Submit(paths) },
-	}, server.WatchBestPath(true))
+		OnBestPathChange: func(changes []server.BestPathChange, _ time.Time) { s.SubmitChanges(changes) },
+	}, server.WatchBestPathChanges(true))
 }

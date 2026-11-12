@@ -1162,3 +1162,38 @@ func TestUpdatePathAttrsClusterIDDefaultsToRouterID(t *testing.T) {
 		assert.Equal(t, []netip.Addr{routerID, netip.MustParseAddr("10.0.0.200")}, updated.GetClusterList())
 	})
 }
+
+func TestForwardingNexthop(t *testing.T) {
+	src := &PeerInfo{AS: 65000, LocalAS: 65001, ID: netip.MustParseAddr("10.0.0.2"), Address: netip.MustParseAddr("fe80::1%eth0")}
+	global := netip.MustParseAddr("2001:db8::1")
+	linkLocal := netip.MustParseAddr("fe80::1")
+	unspecified := netip.MustParseAddr("::")
+	for _, tt := range []struct {
+		name     string
+		nexthops []netip.Addr
+		want     netip.Addr
+	}{
+		{"global only", []netip.Addr{global}, global},
+		{"global wins over link-local", []netip.Addr{global, linkLocal}, global},
+		{"link-local when global is unspecified", []netip.Addr{unspecified, linkLocal}, linkLocal},
+		{"unspecified alone", []netip.Addr{unspecified}, netip.Addr{}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			p := linkLocalNexthopPath(t, src, tt.nexthops...)
+			got := p.ForwardingNexthop()
+			if tt.want.IsValid() {
+				assert.Equal(t, tt.want, got)
+			} else {
+				assert.False(t, got.IsValid() && !got.IsUnspecified(), "got %v", got)
+			}
+			// Same answer as GetNexthop wherever GetNexthop picks one.
+			if tt.want.IsValid() {
+				assert.Equal(t, p.GetNexthop(), got)
+			}
+		})
+	}
+	// A path with no next hop information, such as a withdrawal.
+	nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("192.0.2.0/24"))
+	w := NewPath(bgp.RF_IPv4_UC, src, bgp.PathNLRI{NLRI: nlri}, true, nil, time.Now(), false)
+	assert.False(t, w.ForwardingNexthop().IsValid())
+}
