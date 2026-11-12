@@ -21,12 +21,15 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	api "github.com/osrg/gobgp/v4/api"
+	"github.com/osrg/gobgp/v4/internal/pkg/fib"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -258,5 +261,134 @@ func TestCheckGrpcAddress(t *testing.T) {
 	defer l.Close()
 	if err := checkGrpcAddress(freePort(t) + "," + l.Addr().String()); err == nil {
 		t.Fatal("a taken address in a list must be reported")
+	}
+}
+
+// fakeKernel stands in for the Linux route programmer.
+type fakeKernel struct {
+	mu      sync.Mutex
+	owned   []fib.Route
+	deleted []netip.Prefix
+	closed  bool
+}
+
+func (f *fakeKernel) Replace(fib.Route) error { return nil }
+func (f *fakeKernel) Delete(p netip.Prefix) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleted = append(f.deleted, p)
+	return nil
+}
+func (f *fakeKernel) ListOwned() ([]fib.Route, error) { return f.owned, nil }
+func (f *fakeKernel) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed = true
+	return nil
+}
+
+func fakeKernelRoutes(f *fakeKernel, checkErr error) kernelRoutes {
+	return kernelRoutes{
+		check: func() error { return checkErr },
+		open:  func(fib.KernelOptions) (routeProgrammer, error) { return f, nil },
+	}
+}
+
+func TestFibFlags(t *testing.T) {
+	base := []string{"-asn", "65001", "-router-id", "10.0.0.1", "-fib-sync"}
+	c, err := parseFlags(base, io.Discard)
+	if runtime.GOOS != "linux" {
+		if err == nil {
+			t.Fatal("-fib-sync must be refused where kernel sync is unsupported")
+		}
+		return
+	}
+	if err != nil || !c.FibSync || c.FibProtocol != fib.DefaultProtocol || c.FibTable != fib.DefaultTable || c.FibMetric != fib.DefaultMetric {
+		t.Fatalf("defaults: %+v %v", c, err)
+	}
+	for name, extra := range map[string][]string{
+		"kernel protocol": {"-fib-protocol", "2"},
+		"static protocol": {"-fib-protocol", "4"},
+		"local table":     {"-fib-table", "255"},
+		"zero metric":     {"-fib-metric", "0"},
+	} {
+		if _, err := parseFlags(append(append([]string{}, base...), extra...), io.Discard); err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
+	}
+	// The fib flags are not validated when sync is off.
+	if _, err := parseFlags([]string{"-asn", "1", "-router-id", "10.0.0.1", "-fib-protocol", "2"}, io.Discard); err != nil {
+		t.Fatalf("fib flags should be ignored without -fib-sync: %v", err)
+	}
+}
+
+// bgp starts first, fib second; fib is stopped first. On start fib removes the
+// routes an earlier run left; on stop it closes the programmer.
+func TestFibStageOrderAndCleanup(t *testing.T) {
+	addr := freePort(t)
+	cfg := &config{ASN: 65001, RouterID: "10.0.0.1", ListenPort: -1, GrpcAddr: addr, LogLevel: "info", LogFormat: "text",
+		FibSync: true, FibProtocol: fib.DefaultProtocol, FibTable: fib.DefaultTable, FibMetric: fib.DefaultMetric}
+	logs := &syncBuffer{}
+	logger, lvl := newLogger(cfg, logs)
+	stale := netip.MustParsePrefix("198.51.100.0/24")
+	k := &fakeKernel{owned: []fib.Route{{Prefix: stale, NextHop: netip.MustParseAddr("10.0.0.2")}}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runWithKernel(ctx, cfg, logger, lvl, fakeKernelRoutes(k, nil)) }()
+	waitUntil(t, "the daemon to start", func() bool { return strings.Contains(logs.String(), "veloced started") })
+	k.mu.Lock()
+	gotStale := len(k.deleted) == 1 && k.deleted[0] == stale
+	k.mu.Unlock()
+	if !gotStale {
+		t.Fatalf("stale route not removed on start: %v", k.deleted)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("shutdown error: %v", err)
+	}
+	k.mu.Lock()
+	closed := k.closed
+	k.mu.Unlock()
+	if !closed {
+		t.Fatal("programmer was not closed on stop")
+	}
+	out := logs.String()
+	order := []string{"starting stage=bgp", "starting stage=fib", "stopping stage=fib", "stopping stage=bgp"}
+	last := -1
+	for _, want := range order {
+		i := strings.Index(out, want)
+		if i < 0 || i < last {
+			t.Fatalf("%q missing or out of order in:\n%s", want, out)
+		}
+		last = i
+	}
+}
+
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// Without the privilege to change routes the daemon must refuse to start and
+// leave nothing running, not start and then fail once per route.
+func TestFibStageFailsFastWithoutPrivileges(t *testing.T) {
+	addr := freePort(t)
+	cfg := &config{ASN: 65001, RouterID: "10.0.0.1", ListenPort: -1, GrpcAddr: addr, LogLevel: "error", LogFormat: "text", FibSync: true}
+	logger, lvl := newLogger(cfg, io.Discard)
+	k := &fakeKernel{}
+	err := runWithKernel(context.Background(), cfg, logger, lvl, fakeKernelRoutes(k, errors.New("needs CAP_NET_ADMIN")))
+	if err == nil || !strings.Contains(err.Error(), "CAP_NET_ADMIN") {
+		t.Fatalf("err = %v", err)
+	}
+	if c, derr := net.DialTimeout("tcp", addr, time.Second); derr == nil {
+		c.Close()
+		t.Fatal("the gRPC API was left running after a failed start")
 	}
 }

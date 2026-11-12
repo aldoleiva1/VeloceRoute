@@ -1,10 +1,11 @@
 # veloced: the VeloceRoute daemon
 
 `veloced` is the single binary VeloceRoute is building toward. Today it is a
-skeleton (roadmap task E2-1): it embeds the GoBGP engine and its gRPC API, with
-structured logging, signal handling and an ordered start and stop. WireGuard,
-Linux kernel route sync and Amazon VPC Route Server peering are not in it yet;
-each will be added as a lifecycle stage (tasks E3, E4, E5).
+skeleton (roadmap task E2-1) that embeds the GoBGP engine and its gRPC API, with
+structured logging, signal handling and an ordered start and stop, plus an optional
+Linux kernel route sync stage ([fib.md](fib.md), task E4-1). WireGuard and Amazon VPC
+Route Server peering are not in it yet; each will be added as a lifecycle stage
+(tasks E3, E5).
 
 Source: [`cmd/veloced/`](../../cmd/veloced/).
 
@@ -30,6 +31,7 @@ BGP's own port is 179, which needs root or `CAP_NET_BIND_SERVICE`; use
 | `-log-level` | info | debug, info, warn, error |
 | `-log-format` | text | text or json |
 | `-version` | | print the version and exit |
+| `-fib-sync`, `-fib-protocol`, `-fib-table`, `-fib-metric` | off, 201, 254, 20 | kernel route sync (Linux, needs `CAP_NET_ADMIN`); see [fib.md](fib.md) |
 
 Invalid flags exit with status 2 and a message listing every problem. A real
 config file (global BGP, neighbors, WireGuard, kernel sync, AWS) is task E2-2.
@@ -37,9 +39,10 @@ config file (global BGP, neighbors, WireGuard, kernel sync, AWS) is task E2-2.
 ## What it does
 
 1. Validates the flags, builds the logger.
-2. Starts the stages in order. Today there is one, `bgp`: it checks the gRPC
-   address can be bound, creates the GoBGP server (`server.NewBgpServer`), runs
-   `Serve()` and calls `StartBgp` with the ASN, router ID and listen port.
+2. Starts the stages in order. `bgp`: it checks the gRPC address can be bound,
+   creates the GoBGP server (`server.NewBgpServer`), runs `Serve()` and calls
+   `StartBgp` with the ASN, router ID and listen port. `fib` (only with `-fib-sync`):
+   it checks the privilege, removes stale routes and starts watching best paths.
 3. Waits for SIGINT or SIGTERM. SIGHUP is logged as "not implemented yet"
    (reload is task E2-3).
 4. Stops the stages in **reverse** order, each with a 30 second budget overall.
@@ -82,5 +85,5 @@ shutdown on SIGTERM, and the Linux one runs inside the minimal Alpine lab image
   between that probe and GoBGP's own bind; then GoBGP logs the error and the daemon
   runs without an API. Unix sockets are not probed.
 - No TLS or authentication on the gRPC API yet (task E8-1); keep it on localhost.
-- No config file, reload, WireGuard, kernel sync or AWS support yet.
+- No config file, reload, WireGuard or AWS support yet. Peers can only be added through the gRPC API (for example with the `gobgp` CLI).
 - The Go module path is still `github.com/osrg/gobgp/v4` (decision A-4 is open).

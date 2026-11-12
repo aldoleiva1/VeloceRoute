@@ -45,3 +45,10 @@ By default `feedgen` gives every prefix its own AS path (one prefix per UPDATE).
     go tool pprof -sample_index=alloc_objects -base results/prof/<label>_before.pb.gz -top -cum results/prof/<label>_after.pb.gz
 
 `profile.sh` restarts the daemons, snapshots r2's allocation profile, runs one import, snapshots again. `SKIP_BASELINE=1 ./ab.sh ...` only restarts the daemons.
+
+## Kernel route sync live test
+
+    CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /tmp/veloced-linux ../cmd/veloced
+    ./fib-demo.sh /tmp/veloced-linux      # 11 checks; restores gobgpd on all routers afterwards
+
+Swaps `veloced -fib-sync` in for r2's daemon and checks r2's kernel table (see `../docs/veloceroute/fib.md`). Output of the last run: `results/fib-live-test.txt`.

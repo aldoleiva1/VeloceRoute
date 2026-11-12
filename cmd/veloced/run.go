@@ -23,6 +23,7 @@ import (
 	"time"
 
 	api "github.com/osrg/gobgp/v4/api"
+	"github.com/osrg/gobgp/v4/internal/pkg/fib"
 	"github.com/osrg/gobgp/v4/internal/pkg/version"
 	"github.com/osrg/gobgp/v4/pkg/server"
 )
@@ -50,8 +51,14 @@ func checkGrpcAddress(addr string) error {
 	return nil
 }
 
+// daemon is what the stages share. The bgp stage fills in the server; later
+// stages (kernel sync, and WireGuard before it) use it.
+type daemon struct {
+	bgp *server.BgpServer
+}
+
 // bgpStage runs the embedded GoBGP engine and its gRPC API.
-func bgpStage(cfg *config, logger *slog.Logger, lvl *slog.LevelVar) stage {
+func bgpStage(cfg *config, logger *slog.Logger, lvl *slog.LevelVar, d *daemon) stage {
 	var bgp *server.BgpServer
 	return stage{
 		name: "bgp",
@@ -63,6 +70,7 @@ func bgpStage(cfg *config, logger *slog.Logger, lvl *slog.LevelVar) stage {
 				server.GrpcListenAddress(cfg.GrpcAddr),
 				server.LoggerOption(logger, lvl),
 			)
+			d.bgp = bgp
 			go bgp.Serve()
 			return bgp.StartBgp(ctx, &api.StartBgpRequest{
 				Global: &api.Global{
@@ -84,14 +92,97 @@ func bgpStage(cfg *config, logger *slog.Logger, lvl *slog.LevelVar) stage {
 	}
 }
 
+// kernelRoutes is the part of the fib package veloced needs, so tests can
+// replace the Linux-only implementation with a fake.
+type kernelRoutes struct {
+	check func() error
+	open  func(fib.KernelOptions) (routeProgrammer, error)
+}
+
+type routeProgrammer interface {
+	fib.Programmer
+	Close() error
+}
+
+func realKernel() kernelRoutes {
+	return kernelRoutes{
+		check: fib.CheckPrivileges,
+		open: func(o fib.KernelOptions) (routeProgrammer, error) {
+			return fib.NewKernelProgrammer(o)
+		},
+	}
+}
+
+// fibStage copies BGP best paths into the kernel routing table. It starts after
+// bgp, so there is a server to watch, and stops before it: it removes the
+// routes it installed while the daemon is still shutting down in order.
+func fibStage(cfg *config, logger *slog.Logger, d *daemon, k kernelRoutes) stage {
+	var (
+		syn    *fib.Syncer
+		prog   routeProgrammer
+		cancel context.CancelFunc
+	)
+	return stage{
+		name: "fib",
+		start: func(ctx context.Context) error {
+			if err := k.check(); err != nil {
+				return err
+			}
+			var err error
+			prog, err = k.open(fib.KernelOptions{Table: cfg.FibTable, Protocol: cfg.FibProtocol, Metric: cfg.FibMetric})
+			if err != nil {
+				return err
+			}
+			syn = fib.NewSyncer(prog, logger)
+			// No session is up yet, so any route of ours already in the kernel
+			// is left over from an earlier run and is not valid.
+			if err := syn.Reconcile(); err != nil {
+				prog.Close()
+				return err
+			}
+			// The watch has its own lifetime so that stop, not the cancelled
+			// run context, decides when it ends.
+			var wctx context.Context
+			wctx, cancel = context.WithCancel(context.WithoutCancel(ctx))
+			if err := syn.Watch(wctx, d.bgp); err != nil {
+				cancel()
+				prog.Close()
+				return err
+			}
+			logger.Info("kernel route sync on",
+				slog.Int("protocol", cfg.FibProtocol), slog.Int("table", cfg.FibTable), slog.Int("metric", cfg.FibMetric))
+			return nil
+		},
+		stop: func(context.Context) error {
+			if cancel != nil {
+				cancel()
+			}
+			var err error
+			if syn != nil {
+				err = syn.RemoveAll()
+			}
+			if prog != nil {
+				prog.Close()
+			}
+			return err
+		},
+	}
+}
+
 // run starts the daemon and blocks until ctx is cancelled (a signal, or a
 // test), then shuts down in reverse start order. It returns the start error,
 // or the shutdown errors if shutdown failed.
 func run(ctx context.Context, cfg *config, logger *slog.Logger, lvl *slog.LevelVar) error {
-	lc := &lifecycle{
-		logger: logger,
-		stages: []stage{bgpStage(cfg, logger, lvl)},
+	return runWithKernel(ctx, cfg, logger, lvl, realKernel())
+}
+
+func runWithKernel(ctx context.Context, cfg *config, logger *slog.Logger, lvl *slog.LevelVar, k kernelRoutes) error {
+	d := &daemon{}
+	stages := []stage{bgpStage(cfg, logger, lvl, d)}
+	if cfg.FibSync {
+		stages = append(stages, fibStage(cfg, logger, d, k))
 	}
+	lc := &lifecycle{logger: logger, stages: stages}
 	return runStages(ctx, lc, func() {
 		logger.Info("veloced started",
 			slog.String("version", version.Version()),

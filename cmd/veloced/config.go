@@ -22,7 +22,10 @@ import (
 	"log/slog"
 	"net/netip"
 	"os"
+	"runtime"
 	"strings"
+
+	"github.com/osrg/gobgp/v4/internal/pkg/fib"
 )
 
 // config is the whole configuration of the skeleton: just enough to start the
@@ -35,6 +38,12 @@ type config struct {
 	LogLevel   string
 	LogFormat  string
 	Version    bool
+
+	// Linux kernel route sync (task E4-1).
+	FibSync     bool
+	FibProtocol int // rtnetlink protocol id stamped on our routes
+	FibTable    int // routing table to program
+	FibMetric   int // route priority; see fib.KernelOptions.Metric
 }
 
 func parseFlags(args []string, errOut io.Writer) (*config, error) {
@@ -48,6 +57,10 @@ func parseFlags(args []string, errOut io.Writer) (*config, error) {
 	fs.StringVar(&c.LogLevel, "log-level", "info", "log level: debug, info, warn, error")
 	fs.StringVar(&c.LogFormat, "log-format", "text", "log format: text or json")
 	fs.BoolVar(&c.Version, "version", false, "print the version and exit")
+	fs.BoolVar(&c.FibSync, "fib-sync", false, "copy BGP best paths into the Linux kernel routing table (Linux only; needs CAP_NET_ADMIN)")
+	fs.IntVar(&c.FibProtocol, "fib-protocol", fib.DefaultProtocol, "route protocol id that marks the routes veloced owns (5 to 255)")
+	fs.IntVar(&c.FibTable, "fib-table", fib.DefaultTable, "routing table to program (254 is the main table)")
+	fs.IntVar(&c.FibMetric, "fib-metric", fib.DefaultMetric, "route metric; kept non-zero so a BGP route cannot replace a connected or static one")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -84,6 +97,20 @@ func (c *config) validate() error {
 	}
 	if c.LogFormat != "text" && c.LogFormat != "json" {
 		errs = append(errs, fmt.Errorf("-log-format %q must be text or json", c.LogFormat))
+	}
+	if c.FibSync {
+		if runtime.GOOS != "linux" {
+			errs = append(errs, fib.ErrKernelUnsupported)
+		}
+		if c.FibProtocol < 5 || c.FibProtocol > 255 {
+			errs = append(errs, fmt.Errorf("-fib-protocol %d must be 5 to 255 (0 to 4 are the kernel's own)", c.FibProtocol))
+		}
+		if c.FibTable < 1 || c.FibTable == 255 {
+			errs = append(errs, fmt.Errorf("-fib-table %d is not usable (255 is the local table)", c.FibTable))
+		}
+		if c.FibMetric < 1 {
+			errs = append(errs, fmt.Errorf("-fib-metric %d must be at least 1", c.FibMetric))
+		}
 	}
 	return errors.Join(errs...)
 }

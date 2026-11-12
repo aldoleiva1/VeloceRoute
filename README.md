@@ -11,7 +11,7 @@ Features:
 
 Early stage. The repository starts from upstream [osrg/gobgp](https://github.com/osrg/gobgp) v4.11.0 (commit `f7daa917`, remote `upstream`) and is being tuned for allocation and GC behavior under full-table imports before the new features are added. The original GoBGP README is kept in [README-GoBGP.md](README-GoBGP.md).
 
-**Not built yet:** the WireGuard engine, the Linux Netlink FIB sync and the Amazon VPC Route Server mode. `veloced`, the single binary they will live in, exists as a skeleton ([docs/veloceroute/veloced.md](docs/veloceroute/veloced.md)): it runs the GoBGP engine and its gRPC API with ordered start and stop. Otherwise the code is upstream GoBGP plus performance work. The four features above are the target, and each is tracked as tasks in [ROADMAP.md](ROADMAP.md).
+**Not built yet:** the WireGuard engine and the Amazon VPC Route Server mode. Linux kernel route sync exists in a first form (`veloced -fib-sync`, one next hop per prefix, no ECMP; [docs/veloceroute/fib.md](docs/veloceroute/fib.md)). `veloced`, the single binary they will live in, exists as a skeleton ([docs/veloceroute/veloced.md](docs/veloceroute/veloced.md)): it runs the GoBGP engine and its gRPC API with ordered start and stop. Otherwise the code is upstream GoBGP plus performance work. The four features above are the target, and each is tracked as tasks in [ROADMAP.md](ROADMAP.md).
 
 ### Changes on top of upstream so far
 
@@ -33,6 +33,7 @@ Runtime tuning (no code change): `GOGC=200` plus a `GOMEMLIMIT` cut CPU a furthe
 
 - **[ROADMAP.md](ROADMAP.md)** is the task list for getting to a finished product: every task has an ID, dependencies and a "done when" check. It starts with a progress table showing what is done, in progress and not started.
 - [docs/veloceroute/performance.md](docs/veloceroute/performance.md) explains the performance changes.
+- [docs/veloceroute/fib.md](docs/veloceroute/fib.md) describes the kernel route sync: how it works, why it only touches its own routes, how it was tested, limits.
 - [docs/veloceroute/veloced.md](docs/veloceroute/veloced.md) describes the `veloced` daemon: flags, lifecycle, how stages are added, limits.
 - [docs/veloceroute/blueprint.md](docs/veloceroute/blueprint.md) is the corrected design for the WireGuard, Netlink and AWS Route Server work, with the AWS facts checked against AWS documentation.
 
@@ -42,7 +43,7 @@ Runtime tuning (no code change): `GOGC=200` plus a `GOMEMLIMIT` cut CPU a furthe
 go build -v -o bin/gobgpd ./cmd/gobgpd && go build -v -o bin/gobgp ./cmd/gobgp
 CGO_ENABLED=0 go build -o bin/veloced ./cmd/veloced     # the VeloceRoute daemon (static)
 go test -v ./pkg/packet/bgp/...        # packet tests
-go test -race ./cmd/veloced            # veloced skeleton tests
+go test -race ./cmd/veloced ./internal/pkg/fib   # veloced and kernel route sync (the netlink tests skip without CAP_NET_ADMIN)
 go test -v -race ./pkg/server/...      # server tests (4 fail on macOS, see below)
 go test -run XXX -bench 'UpdateSerialize|UpdateDecode' -benchmem ./pkg/packet/bgp/
 ```

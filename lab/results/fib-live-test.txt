@@ -1,0 +1,17 @@
+== start: empty lab tables, veloced replaces gobgpd on r2
+PASS  learned prefixes appear in ip route (proto 201, metric 20)
+PASS  kernel connected route for an overlapping prefix is untouched
+PASS  prefix with an unreachable next hop is not installed
+PASS  unreachable next hop was logged once as a warning
+PASS  withdrawn prefixes are removed from ip route
+PASS  kernel connected route still there after the overlapping prefix was withdrawn
+PASS  clean stop (SIGTERM) removes every route veloced installed
+PASS  routes are relearned after restart
+PASS  kill -9 leaves stale routes (expected)
+PASS  stale routes from the crash are removed on the next start
+PASS  the kernel's own routes survive everything
+== restore: stop veloced, restart gobgpd on all routers
+Peer         AS  Up/Down State       |#Received  Accepted
+10.0.12.1 65001 00:00:07 Establ      |        0         0
+10.0.23.2 65003 00:00:06 Establ      |        0         0
+== 11 passed, 0 failed
