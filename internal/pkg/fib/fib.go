@@ -16,13 +16,16 @@
 // table. The sync logic here is portable and talks to a Programmer; the Linux
 // Programmer (kernel_linux.go) uses netlink.
 //
-// Scope today (roadmap tasks E4-1 and E4-3): IPv4 and IPv6 unicast, routes
-// learned from peers only, one next hop per prefix or, when the BGP server
-// runs with multiple paths, an ECMP route with every equal-cost next hop.
-// Next hop resolution and bulk programming are tasks E4-2 and E4-5.
+// Scope today (roadmap tasks E4-1, E4-2 and E4-3): IPv4 and IPv6 unicast,
+// routes learned from peers only, one next hop per prefix or, when the BGP
+// server runs with multiple paths, an ECMP route with every equal-cost next
+// hop. Next hops that are not reachable yet are retried when the network
+// changes, a route the kernel drops is put back, and an IPv6 link-local next
+// hop is bound to the peer's interface. Bulk programming is task E4-5.
 package fib
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -30,6 +33,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/osrg/gobgp/v4/pkg/apiutil"
 	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
@@ -55,8 +59,13 @@ func (r Route) String() string {
 // given no other limit.
 const DefaultMaxNextHops = 64
 
+// DefaultRetryInterval is how often Run retries routes that are waiting for a
+// next hop to become reachable, as a safety net beside change notifications.
+const DefaultRetryInterval = 30 * time.Second
+
 // ErrNextHopUnreachable means the operating system cannot reach the next hop
-// (it is not on a connected network). The route is skipped, not retried.
+// (it is not on a connected network, or its interface is missing). The route is
+// not installed now; the syncer retries when the network changes.
 var ErrNextHopUnreachable = errors.New("next hop is not reachable")
 
 // ErrKernelUnsupported is returned where there is no kernel route programmer
@@ -77,6 +86,29 @@ type Programmer interface {
 	// ListOwned returns every route this programmer owns, for cleanup of
 	// routes left behind by an earlier run.
 	ListOwned() ([]Route, error)
+	// Lookup returns our route for the prefix as it is in the operating
+	// system now, and whether there is one.
+	Lookup(netip.Prefix) (Route, bool, error)
+}
+
+// Change is a hint that the operating system's routing state moved under the
+// syncer. It is only a hint: the syncer checks the real state before acting.
+type Change struct {
+	// Prefix is valid when one of our routes for the prefix was removed.
+	Prefix netip.Prefix
+	// Reach is set when something happened that can make a next hop reachable
+	// (a link came up, an address or a route was added).
+	Reach bool
+	// Resync is set when routes of ours may have been dropped without a
+	// notification (an address or link went away) or when notifications may
+	// have been lost: check everything.
+	Resync bool
+}
+
+// ChangeSource reports Changes until ctx is cancelled, when it closes the
+// channel. Delivery may drop events, but then it sends a Resync.
+type ChangeSource interface {
+	Changes(ctx context.Context) (<-chan Change, error)
 }
 
 // Stats counts what the syncer has done, for logs and tests.
@@ -85,6 +117,8 @@ type Stats struct {
 	Replaced    uint64
 	Deleted     uint64
 	Unreachable uint64 // next hop not reachable, route skipped
+	Recovered   uint64 // routes installed by a retry after their next hop became reachable
+	Drifted     uint64 // routes the kernel dropped or changed behind our back, restored
 	Errors      uint64 // other programmer errors
 	Skipped     uint64 // paths not eligible (local, unsupported family, no next hop)
 }
@@ -108,9 +142,11 @@ type entry struct {
 	// prefix it holds at most one; with multiple paths, one per equal-cost path.
 	cands []candidate
 	// applied is the next hop set the last Replace was asked for; installed says
-	// whether the kernel holds a route of ours for the prefix. They differ from
-	// the set in the kernel only when some next hops were unreachable.
+	// whether the kernel holds a route of ours for the prefix. live is what is
+	// in the kernel when that is less than applied (some next hops were
+	// unreachable); nil means all of applied.
 	applied   []netip.Addr
+	live      []netip.Addr
 	installed bool
 	// failed is set when the last install failed or left out unreachable next
 	// hops, so that a repeat is logged once.
@@ -136,6 +172,10 @@ func WithMultipath(maxNextHops int) Option {
 	}
 }
 
+// WithDebounce sets how long Run waits to batch a burst of changes. Tests use a
+// short time.
+func WithDebounce(d time.Duration) Option { return func(s *Syncer) { s.debounce = d } }
+
 // Syncer turns best path events into Programmer calls. All state is guarded by
 // a mutex; events are normally delivered from one goroutine, which keeps the
 // kernel table a single-writer copy of the best paths.
@@ -145,9 +185,15 @@ type Syncer struct {
 	multipath   bool
 	maxNextHops int
 
-	mu         sync.Mutex
-	entries    map[netip.Prefix]entry
-	dirty      []netip.Prefix // prefixes changed by the event being handled, in order
+	debounce time.Duration
+
+	mu      sync.Mutex
+	entries map[netip.Prefix]entry
+	// pending holds prefixes that should be retried when the network changes:
+	// no route could be installed for them, or only some of the next hops.
+	pending    map[netip.Prefix]struct{}
+	noZoneWarn map[netip.Addr]struct{} // peers already warned about a link-local next hop without interface
+	dirty      []netip.Prefix          // prefixes changed by the event being handled, in order
 	dirtySet   map[netip.Prefix]struct{}
 	nInstalled int
 	stats      Stats
@@ -163,6 +209,9 @@ func NewSyncer(prog Programmer, logger *slog.Logger, opts ...Option) *Syncer {
 		maxNextHops: 1,
 		entries:     map[netip.Prefix]entry{},
 		dirtySet:    map[netip.Prefix]struct{}{},
+		pending:     map[netip.Prefix]struct{}{},
+		noZoneWarn:  map[netip.Addr]struct{}{},
+		debounce:    200 * time.Millisecond,
 	}
 	for _, o := range opts {
 		o(s)
@@ -258,9 +307,16 @@ func (s *Syncer) handle(p *apiutil.Path) {
 	src := source{peer: p.PeerAddress, id: p.RemoteID}
 	e := s.entries[prefix]
 	switch disp {
-	case dispRemove:
+	case dispRemove, dispNoInterface:
 		// A withdrawal, or a path we do not program (locally originated,
 		// unusable next hop).
+		if disp == dispNoInterface {
+			if _, warned := s.noZoneWarn[p.PeerAddress]; !warned {
+				s.noZoneWarn[p.PeerAddress] = struct{}{}
+				s.logger.Warn("routes from this peer have a link-local next hop but the peer has no interface, not programming them",
+					slog.String("peer", p.PeerAddress.String()), slog.String("next_hop", nh.String()))
+			}
+		}
 		if !p.Withdrawal {
 			s.stats.Skipped++
 		}
@@ -334,7 +390,8 @@ func (s *Syncer) apply(prefix netip.Prefix, e entry) {
 	switch {
 	case len(want) == 0:
 		e.failed = false
-		e.applied = nil
+		e.applied, e.live = nil, nil
+		delete(s.pending, prefix)
 		if e.installed {
 			if err := s.prog.Delete(prefix); err != nil {
 				s.stats.Errors++
@@ -350,23 +407,45 @@ func (s *Syncer) apply(prefix netip.Prefix, e entry) {
 	case e.installed && slices.Equal(want, e.applied):
 		s.entries[prefix] = e // nothing changed
 	default:
-		s.install(prefix, want, e)
+		s.install(prefix, want, e, true)
 	}
 }
 
-func (s *Syncer) install(prefix netip.Prefix, want []netip.Addr, e entry) {
+// install programs want for the prefix and records the result. With probe set,
+// an unreachable next hop in an ECMP route is worked around by finding the
+// reachable ones; without it (a retry of a route that is already partly
+// installed) a refusal just leaves the route as it is.
+func (s *Syncer) install(prefix netip.Prefix, want []netip.Addr, e entry, probe bool) {
 	r := Route{Prefix: prefix, NextHops: want}
+	before := 0
+	if e.installed {
+		before = len(e.applied)
+		if e.live != nil {
+			before = len(e.live)
+		}
+	}
 	err := s.prog.Replace(r)
+	ok := want
 	var skipped []netip.Addr
-	if err != nil && errors.Is(err, ErrNextHopUnreachable) && len(want) > 1 {
+	if err != nil && errors.Is(err, ErrNextHopUnreachable) && len(want) > 1 && probe {
 		// One unreachable next hop must not take the reachable ones down with
 		// it: program the ones that work.
-		skipped, err = s.installReachable(r)
+		ok, skipped, err = s.installReachable(r)
 	}
 	if err != nil {
+		if e.installed && !probe && errors.Is(err, ErrNextHopUnreachable) {
+			s.entries[prefix] = e // still as partial as before; try again later
+			return
+		}
 		s.noteFailure(prefix, r, err, e.failed)
 		e.failed = true
-		e.applied = nil
+		e.applied, e.live = nil, nil
+		// Only an unreachable next hop can resolve by itself later.
+		if errors.Is(err, ErrNextHopUnreachable) {
+			s.pending[prefix] = struct{}{}
+		} else {
+			delete(s.pending, prefix)
+		}
 		// The old route (if any) points at paths that are no longer the
 		// answer, so remove it rather than keep forwarding along stale
 		// information.
@@ -389,7 +468,13 @@ func (s *Syncer) install(prefix netip.Prefix, want []netip.Addr, e entry) {
 			s.logger.Warn("some next hops not reachable, route installed with the others",
 				slog.String("prefix", prefix.String()), slog.Any("unreachable", skipped))
 		}
+		s.pending[prefix] = struct{}{}
+		e.live = ok
+	} else {
+		delete(s.pending, prefix)
+		e.live = nil
 	}
+	wasFailed := e.failed
 	if !e.installed {
 		s.nInstalled++
 	}
@@ -397,6 +482,10 @@ func (s *Syncer) install(prefix netip.Prefix, want []netip.Addr, e entry) {
 	e.failed = len(skipped) > 0 // a partial route is not retried noisily
 	e.applied = want
 	s.stats.Replaced++
+	if wasFailed && len(ok) > before {
+		s.stats.Recovered++
+		s.logger.Info("route installed after its next hop became reachable", slog.String("route", Route{Prefix: prefix, NextHops: ok}.String()))
+	}
 	s.entries[prefix] = e
 	s.logger.Debug("route installed", slog.String("route", r.String()))
 }
@@ -406,8 +495,7 @@ func (s *Syncer) install(prefix netip.Prefix, want []netip.Addr, e entry) {
 // trying each one alone, then installs those together. It returns the next
 // hops that were left out. Only on the failure path does this cost extra
 // kernel calls.
-func (s *Syncer) installReachable(r Route) (skipped []netip.Addr, err error) {
-	var ok []netip.Addr
+func (s *Syncer) installReachable(r Route) (ok, skipped []netip.Addr, err error) {
 	var firstErr error
 	for _, h := range r.NextHops {
 		perr := s.prog.Replace(Route{Prefix: r.Prefix, NextHops: []netip.Addr{h}})
@@ -421,20 +509,20 @@ func (s *Syncer) installReachable(r Route) (skipped []netip.Addr, err error) {
 			}
 		default:
 			s.cleanProbe(r.Prefix, len(ok) > 0)
-			return nil, perr
+			return nil, nil, perr
 		}
 	}
 	switch {
 	case len(ok) == 0:
-		return nil, firstErr
+		return nil, nil, firstErr
 	case len(ok) == 1:
-		return skipped, nil // the route the last probe left is the answer
+		return ok, skipped, nil // the route the last probe left is the answer
 	}
 	if err := s.prog.Replace(Route{Prefix: r.Prefix, NextHops: ok}); err != nil {
 		s.cleanProbe(r.Prefix, true)
-		return nil, err
+		return nil, nil, err
 	}
-	return skipped, nil
+	return ok, skipped, nil
 }
 
 // cleanProbe removes the single-next-hop route a probe left behind when the
@@ -447,9 +535,10 @@ func (s *Syncer) cleanProbe(prefix netip.Prefix, left bool) {
 
 func (s *Syncer) noteFailure(prefix netip.Prefix, r Route, err error, already bool) {
 	if errors.Is(err, ErrNextHopUnreachable) {
-		s.stats.Unreachable++
+		// Counted and logged once per outage, not on every retry.
 		if !already {
-			s.logger.Warn("route skipped, next hop not reachable", slog.String("route", r.String()))
+			s.stats.Unreachable++
+			s.logger.Warn("route skipped, next hop not reachable, will retry when the network changes", slog.String("route", r.String()))
 		}
 		return
 	}
@@ -462,9 +551,10 @@ func (s *Syncer) noteFailure(prefix netip.Prefix, r Route, err error, already bo
 type disposition int
 
 const (
-	dispIgnore  disposition = iota // not a path this package handles
-	dispProgram                    // install this route
-	dispRemove                     // remove our route for the prefix, if any
+	dispIgnore      disposition = iota // not a path this package handles
+	dispProgram                        // install this route
+	dispRemove                         // remove our route for the prefix, if any
+	dispNoInterface                    // link-local next hop and no interface to bind it to: remove, and warn
 )
 
 // classify decides what a best path event means for the kernel table.
@@ -475,6 +565,8 @@ const (
 //     ourselves), a next hop GoBGP marked invalid, or a next hop of a different
 //     address family than the prefix cannot be programmed; if such a path is
 //     now the best, a route we installed earlier is stale, so it is removed.
+//   - An IPv6 link-local next hop is bound to the interface named in the
+//     peer's address (its zone); without one it cannot be programmed.
 func classify(p *apiutil.Path) (netip.Prefix, netip.Addr, disposition) {
 	if p == nil {
 		return netip.Prefix{}, netip.Addr{}, dispIgnore
@@ -499,7 +591,18 @@ func classify(p *apiutil.Path) (netip.Prefix, netip.Addr, disposition) {
 		// different kernel encoding; not supported yet.
 		return prefix, netip.Addr{}, dispRemove
 	}
-	return prefix, nh, dispProgram
+	if nh.Is6() && nh.IsLinkLocalUnicast() {
+		// A link-local gateway means nothing without an interface (the kernel
+		// refuses it), and the only place the interface is known is the
+		// peer's address: GoBGP gives a peer reached over a link-local address
+		// a zone.
+		zone := p.PeerAddress.Zone()
+		if zone == "" {
+			return prefix, nh, dispNoInterface
+		}
+		return prefix, nh.WithZone(zone), dispProgram
+	}
+	return prefix, nh.WithZone(""), dispProgram
 }
 
 func nextHopOf(p *apiutil.Path) netip.Addr {
@@ -516,4 +619,200 @@ func nextHopOf(p *apiutil.Path) netip.Addr {
 		}
 	}
 	return netip.Addr{}
+}
+
+// ---- retry and drift repair (task E4-2) ----
+
+// RetryPending tries again the prefixes that could not be fully installed
+// because a next hop was not reachable. It is cheap when there are none, so it
+// can run on every network change and on a timer.
+func (s *Syncer) RetryPending() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return
+	}
+	for prefix := range s.pending {
+		e, ok := s.entries[prefix]
+		if !ok {
+			delete(s.pending, prefix)
+			continue
+		}
+		want := s.wanted(prefix, e.cands)
+		if len(want) == 0 {
+			delete(s.pending, prefix)
+			continue
+		}
+		s.install(prefix, want, e, !e.installed)
+	}
+}
+
+// Verify checks one prefix against the operating system and puts our route
+// back if it was removed or changed behind our back (an address removed or a
+// link that went down makes the kernel drop routes through it). If the next
+// hop is unreachable at that point the prefix becomes pending and comes back
+// when the network does.
+//
+// Finding one route costs a pass over our routes in the kernel, so for many
+// prefixes use VerifyAll.
+func (s *Syncer) Verify(prefix netip.Prefix) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return
+	}
+	e, ok := s.entries[prefix]
+	if !ok || !e.installed {
+		return
+	}
+	got, found, err := s.prog.Lookup(prefix)
+	if err != nil {
+		s.stats.Errors++
+		s.logger.Error("failed to look up route", slog.String("prefix", prefix.String()), slog.String("error", err.Error()))
+		return
+	}
+	s.checkDrift(prefix, e, got, found)
+}
+
+// VerifyAll is Verify for every route, with one pass over the kernel's routes.
+func (s *Syncer) VerifyAll() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return
+	}
+	owned, err := s.prog.ListOwned()
+	if err != nil {
+		s.stats.Errors++
+		s.logger.Error("failed to list routes", slog.String("error", err.Error()))
+		return
+	}
+	have := make(map[netip.Prefix]Route, len(owned))
+	for _, r := range owned {
+		if cur, dup := have[r.Prefix]; dup {
+			r.NextHops = append(cur.NextHops, r.NextHops...)
+			slices.SortFunc(r.NextHops, netip.Addr.Compare)
+		}
+		have[r.Prefix] = r
+	}
+	for prefix, e := range s.entries {
+		if !e.installed {
+			continue
+		}
+		got, found := have[prefix]
+		s.checkDrift(prefix, e, got, found)
+	}
+}
+
+func (s *Syncer) checkDrift(prefix netip.Prefix, e entry, got Route, found bool) {
+	live := e.applied
+	if e.live != nil {
+		live = e.live
+	}
+	if found && slices.Equal(got.NextHops, live) {
+		return
+	}
+	s.stats.Drifted++
+	s.logger.Warn("kernel route was removed or changed outside veloced, restoring it",
+		slog.String("prefix", prefix.String()), slog.Bool("found", found))
+	e.installed = false
+	e.applied, e.live = nil, nil
+	s.nInstalled--
+	want := s.wanted(prefix, e.cands)
+	if len(want) == 0 {
+		s.entries[prefix] = e
+		return
+	}
+	s.install(prefix, want, e, true)
+}
+
+// changeBatch is what Run collects during the debounce time.
+type changeBatch struct {
+	prefixes map[netip.Prefix]struct{}
+	reach    bool
+	resync   bool
+}
+
+func (b *changeBatch) add(c Change) {
+	if c.Prefix.IsValid() {
+		if b.prefixes == nil {
+			b.prefixes = map[netip.Prefix]struct{}{}
+		}
+		b.prefixes[c.Prefix] = struct{}{}
+	}
+	b.reach = b.reach || c.Reach
+	b.resync = b.resync || c.Resync
+}
+
+// maxPrefixLookups is how many single-prefix checks one batch may make before
+// the syncer does one full pass instead.
+const maxPrefixLookups = 2
+
+func (s *Syncer) process(b *changeBatch) {
+	switch {
+	case b.resync || len(b.prefixes) > maxPrefixLookups:
+		s.VerifyAll()
+	default:
+		for p := range b.prefixes {
+			s.Verify(p)
+		}
+	}
+	// Whatever changed may also have made a waiting next hop reachable.
+	s.RetryPending()
+}
+
+// Run watches the operating system for changes in the background until ctx is
+// cancelled: it repairs routes the kernel dropped and retries prefixes whose
+// next hop was not reachable, when something that could fix that changes and,
+// as a safety net against lost notifications, every retryEvery (0 turns the
+// timer off). It returns once the subscription is in place. Start it before
+// Watch so no change between the two is missed.
+func (s *Syncer) Run(ctx context.Context, src ChangeSource, retryEvery time.Duration) error {
+	ch, err := src.Changes(ctx)
+	if err != nil {
+		return fmt.Errorf("watch network changes: %w", err)
+	}
+	go func() {
+		var tick <-chan time.Time
+		if retryEvery > 0 {
+			t := time.NewTicker(retryEvery)
+			defer t.Stop()
+			tick = t.C
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick:
+				s.RetryPending()
+			case c, ok := <-ch:
+				if !ok {
+					return
+				}
+				var b changeBatch
+				b.add(c)
+				// Changes arrive in bursts (a link going down removes every
+				// route through it); handle the burst once.
+				timer := time.NewTimer(s.debounce)
+			collect:
+				for {
+					select {
+					case c2, ok := <-ch:
+						if !ok {
+							timer.Stop()
+							return
+						}
+						b.add(c2)
+					case <-timer.C:
+						break collect
+					case <-ctx.Done():
+						timer.Stop()
+						return
+					}
+				}
+				s.process(&b)
+			}
+		}
+	}()
+	return nil
 }

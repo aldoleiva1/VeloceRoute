@@ -15,14 +15,18 @@
 package fib
 
 import (
+	"context"
 	"errors"
 	"net"
 	"net/netip"
 	"runtime"
 	"slices"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/osrg/gobgp/v4/pkg/apiutil"
+	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
@@ -579,5 +583,310 @@ func TestKernelSyncerEcmpEndToEnd(t *testing.T) {
 	}
 	if owned, _ := p.ListOwned(); len(owned) != 0 {
 		t.Fatalf("routes left after RemoveAll: %v", owned)
+	}
+}
+
+// ---- interface binding, lookup, change notifications, recovery (task E4-2) ----
+
+// addVeth adds a second veth pair (name and name+"1") with the first end up.
+func (n *testNS) addVeth(name string) {
+	n.t.Helper()
+	if err := n.h.LinkAdd(&netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: name}, PeerName: name + "1"}); err != nil {
+		n.t.Skipf("cannot create a veth pair: %v", err)
+	}
+	for _, nm := range []string{name, name + "1"} {
+		l, err := n.h.LinkByName(nm)
+		if err != nil {
+			n.t.Fatal(err)
+		}
+		if err := n.h.LinkSetUp(l); err != nil {
+			n.t.Fatal(err)
+		}
+	}
+}
+
+func (n *testNS) ifindex(name string) int {
+	n.t.Helper()
+	l, err := n.h.LinkByName(name)
+	if err != nil {
+		n.t.Fatal(err)
+	}
+	return l.Attrs().Index
+}
+
+// The kernel refuses a link-local gateway without an interface. With the zone
+// the route is bound to that interface, and listing gives the zone back.
+func TestKernelLinkLocalNextHopIsBoundToItsInterface(t *testing.T) {
+	n := newTestNS(t)
+	p := n.programmer(t)
+	dst := pfx("2001:db8:50::/48")
+
+	err := p.Replace(rt(dst, ip("fe80::2")))
+	if err == nil || errors.Is(err, ErrNextHopUnreachable) {
+		t.Fatalf("a link-local next hop without interface: err = %v, want a plain refusal", err)
+	}
+
+	if err := p.Replace(rt(dst, ip("fe80::2%v0"))); err != nil {
+		t.Fatalf("link-local next hop with interface: %v", err)
+	}
+	rs := n.find(netlink.FAMILY_V6, dst.String())
+	if len(rs) != 1 || rs[0].Gw.String() != "fe80::2" || rs[0].LinkIndex != n.ifindex("v0") {
+		t.Fatalf("route not bound to v0: %v", rs)
+	}
+	owned, err := p.ListOwned()
+	if err != nil || len(owned) != 1 || !slices.Equal(owned[0].NextHops, []netip.Addr{ip("fe80::2%v0")}) {
+		t.Fatalf("ListOwned = %v, %v", owned, err)
+	}
+	// An interface number works as a zone too.
+	if err := p.Replace(rt(dst, ip("fe80::2%"+strconv.Itoa(n.ifindex("v0"))))); err != nil {
+		t.Fatalf("numeric zone: %v", err)
+	}
+	// An interface that does not exist is a next hop that is not reachable (yet).
+	if err := p.Replace(rt(dst, ip("fe80::2%nosuch0"))); !errors.Is(err, ErrNextHopUnreachable) {
+		t.Fatalf("unknown interface: err = %v, want ErrNextHopUnreachable", err)
+	}
+}
+
+// ECMP over two interfaces: each next hop keeps its own interface.
+func TestKernelEcmpBindsEachLinkLocalNextHopToItsOwnInterface(t *testing.T) {
+	n := newTestNS(t)
+	n.addVeth("w0")
+	p := n.programmer(t)
+	dst := pfx("2001:db8:50::/48")
+	if err := p.Replace(rt(dst, ip("fe80::2%v0"), ip("fe80::3%w0"))); err != nil {
+		t.Fatalf("ecmp over two interfaces: %v", err)
+	}
+	rs := n.find(netlink.FAMILY_V6, dst.String())
+	if len(rs) != 1 || len(rs[0].MultiPath) != 2 {
+		t.Fatalf("want one multipath route: %v", rs)
+	}
+	got := map[string]int{}
+	for _, h := range rs[0].MultiPath {
+		got[h.Gw.String()] = h.LinkIndex
+	}
+	if got["fe80::2"] != n.ifindex("v0") || got["fe80::3"] != n.ifindex("w0") {
+		t.Fatalf("interfaces: %v", got)
+	}
+	owned, _ := p.ListOwned()
+	if len(owned) != 1 || !slices.Equal(owned[0].NextHops, []netip.Addr{ip("fe80::2%v0"), ip("fe80::3%w0")}) {
+		t.Fatalf("ListOwned = %v", owned)
+	}
+}
+
+func TestKernelLookup(t *testing.T) {
+	n := newTestNS(t)
+	p := n.programmer(t)
+	if _, found, err := p.Lookup(pfx("192.0.2.0/24")); err != nil || found {
+		t.Fatalf("empty table: found=%v err=%v", found, err)
+	}
+	if err := p.Replace(rt(pfx("192.0.2.0/24"), ip("10.0.12.2"), ip("10.0.12.3"))); err != nil {
+		t.Fatal(err)
+	}
+	r, found, err := p.Lookup(pfx("192.0.2.0/24"))
+	if err != nil || !found || !slices.Equal(r.NextHops, []netip.Addr{ip("10.0.12.2"), ip("10.0.12.3")}) {
+		t.Fatalf("Lookup = %v, %v, %v", r, found, err)
+	}
+	if _, found, _ := p.Lookup(pfx("198.51.100.0/24")); found {
+		t.Fatal("found a route that is not there")
+	}
+}
+
+func nextChange(t *testing.T, ch <-chan Change, within time.Duration, match func(Change) bool) (Change, bool) {
+	t.Helper()
+	timer := time.After(within)
+	for {
+		select {
+		case c, ok := <-ch:
+			if !ok {
+				return Change{}, false
+			}
+			if match(c) {
+				return c, true
+			}
+		case <-timer:
+			return Change{}, false
+		}
+	}
+}
+
+// Our own installs are not reported; the removal of our route, an address
+// coming, a link coming up and someone else's route are.
+func TestKernelChanges(t *testing.T) {
+	n := newTestNS(t)
+	p := n.programmer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := p.(ChangeSource).Changes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Installing and replacing our own route is silent.
+	if err := p.Replace(rt(pfx("192.0.2.0/24"), ip("10.0.12.2"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Replace(rt(pfx("192.0.2.0/24"), ip("10.0.12.2"), ip("10.0.12.3"))); err != nil {
+		t.Fatal(err)
+	}
+	if c, got := nextChange(t, ch, 300*time.Millisecond, func(Change) bool { return true }); got {
+		t.Fatalf("our own install was reported: %+v", c)
+	}
+
+	// Someone removes our route.
+	routes, _ := n.h.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{Table: unix.RT_TABLE_MAIN, Protocol: DefaultProtocol}, netlink.RT_FILTER_TABLE|netlink.RT_FILTER_PROTOCOL)
+	if len(routes) != 1 {
+		t.Fatalf("setup: %v", routes)
+	}
+	if err := n.h.RouteDel(&routes[0]); err != nil {
+		t.Fatal(err)
+	}
+	if c, got := nextChange(t, ch, 3*time.Second, func(c Change) bool { return c.Prefix.IsValid() }); !got || c.Prefix != pfx("192.0.2.0/24") {
+		t.Fatalf("removal of our route not reported: %+v %v", c, got)
+	}
+
+	// A foreign route, an address and a link coming up all say "reach changed".
+	if err := n.h.RouteAdd(&netlink.Route{Dst: ipNet(pfx("203.0.113.0/24")), Gw: net.ParseIP("10.0.12.9"), Table: unix.RT_TABLE_MAIN, Protocol: unix.RTPROT_STATIC}); err != nil {
+		t.Fatal(err)
+	}
+	if _, got := nextChange(t, ch, 3*time.Second, func(c Change) bool { return c.Reach }); !got {
+		t.Fatal("a foreign route was not reported")
+	}
+	v0, _ := n.h.LinkByName("v0")
+	n.addr(v0, "10.0.99.1/24")
+	if _, got := nextChange(t, ch, 3*time.Second, func(c Change) bool { return c.Reach }); !got {
+		t.Fatal("a new address was not reported")
+	}
+	if err := n.h.LinkSetDown(v0); err != nil {
+		t.Fatal(err)
+	}
+	// Drain what the link going down caused, then bring it up.
+	nextChange(t, ch, 300*time.Millisecond, func(Change) bool { return false })
+	if err := n.h.LinkSetUp(v0); err != nil {
+		t.Fatal(err)
+	}
+	if _, got := nextChange(t, ch, 3*time.Second, func(c Change) bool { return c.Reach }); !got {
+		t.Fatal("a link coming up was not reported")
+	}
+
+	cancel()
+	if _, ok := nextChange(t, ch, 3*time.Second, func(Change) bool { return false }); ok {
+		t.Fatal("channel still open after cancel")
+	}
+}
+
+func startKernelSyncer(t *testing.T, n *testNS, opts ...Option) (*Syncer, interface {
+	Programmer
+	Close() error
+}) {
+	t.Helper()
+	p := n.programmer(t)
+	s := NewSyncer(p, quiet(), append([]Option{WithDebounce(20 * time.Millisecond)}, opts...)...)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := s.Run(ctx, p.(ChangeSource), 0); err != nil {
+		t.Fatal(err)
+	}
+	return s, p
+}
+
+func waitKernel(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// The kernel drops a route when the address under its next hop is removed and
+// does not bring it back when the address returns. The syncer must.
+func TestKernelRouteComesBackAfterAnAddressIsRemovedAndReadded(t *testing.T) {
+	n := newTestNS(t)
+	s, _ := startKernelSyncer(t, n)
+	s.HandleBestPaths([]*apiutil.Path{v4(t, "192.0.2.0/24", "10.0.12.2")})
+	if len(n.find(netlink.FAMILY_V4, "192.0.2.0/24")) != 1 {
+		t.Fatal("route not installed")
+	}
+
+	v0, _ := n.h.LinkByName("v0")
+	a, _ := netlink.ParseAddr("10.0.12.1/24")
+	if err := n.h.AddrDel(v0, a); err != nil {
+		t.Fatal(err)
+	}
+	waitKernel(t, "the syncer to notice the route is gone", func() bool { return s.Stats().Drifted == 1 })
+	if len(n.find(netlink.FAMILY_V4, "192.0.2.0/24")) != 0 {
+		t.Fatal("route is back although its next hop is unreachable")
+	}
+	if st := s.Stats(); st.Installed != 0 {
+		t.Fatalf("stats %+v", st)
+	}
+
+	if err := n.h.AddrAdd(v0, a); err != nil {
+		t.Fatal(err)
+	}
+	waitKernel(t, "the route to return with its address", func() bool { return len(n.find(netlink.FAMILY_V4, "192.0.2.0/24")) == 1 })
+	if st := s.Stats(); st.Installed != 1 || st.Recovered != 1 {
+		t.Fatalf("stats %+v", st)
+	}
+}
+
+func TestKernelRouteComesBackAfterALinkFlap(t *testing.T) {
+	n := newTestNS(t)
+	s, _ := startKernelSyncer(t, n, WithMultipath(0))
+	s.HandleBestPaths([]*apiutil.Path{
+		from(v4(t, "192.0.2.0/24", "10.0.12.2"), "10.0.12.2"),
+		from(v4(t, "192.0.2.0/24", "10.0.12.3"), "10.0.12.3"),
+		from(v4(t, "198.51.100.0/24", "10.0.12.2"), "10.0.12.2"),
+	})
+	v0, _ := n.h.LinkByName("v0")
+	if err := n.h.LinkSetDown(v0); err != nil {
+		t.Fatal(err)
+	}
+	waitKernel(t, "the link down to drop our routes", func() bool { return len(n.find(netlink.FAMILY_V4, "192.0.2.0/24")) == 0 })
+	if err := n.h.LinkSetUp(v0); err != nil {
+		t.Fatal(err)
+	}
+	waitKernel(t, "both routes to return", func() bool {
+		a := n.find(netlink.FAMILY_V4, "192.0.2.0/24")
+		b := n.find(netlink.FAMILY_V4, "198.51.100.0/24")
+		return len(a) == 1 && len(b) == 1 && slices.Equal(gws(a[0]), []string{"10.0.12.2", "10.0.12.3"})
+	})
+	if st := s.Stats(); st.Installed != 2 {
+		t.Fatalf("stats %+v", st)
+	}
+}
+
+// A next hop that is not reachable when the path arrives is installed once a
+// route to it appears.
+func TestKernelRouteIsInstalledWhenTheNextHopBecomesReachable(t *testing.T) {
+	n := newTestNS(t)
+	s, _ := startKernelSyncer(t, n)
+	s.HandleBestPaths([]*apiutil.Path{v4(t, "192.0.2.0/24", "10.0.77.2")}) // no network for it yet
+	if st := s.Stats(); st.Installed != 0 || st.Unreachable != 1 {
+		t.Fatalf("stats %+v", st)
+	}
+	v0, _ := n.h.LinkByName("v0")
+	n.addr(v0, "10.0.77.1/24")
+	waitKernel(t, "the route to be installed", func() bool { return len(n.find(netlink.FAMILY_V4, "192.0.2.0/24")) == 1 })
+	if st := s.Stats(); st.Installed != 1 || st.Recovered != 1 {
+		t.Fatalf("stats %+v", st)
+	}
+}
+
+// A link-local next hop through a real kernel and syncer: bound to the peer's
+// interface by the zone of its address.
+func TestKernelSyncerBindsLinkLocalNextHopToThePeerInterface(t *testing.T) {
+	n := newTestNS(t)
+	p := n.programmer(t)
+	s := NewSyncer(p, quiet())
+	path := v6(t, "2001:db8:50::/48", "::")
+	path.Attrs[0].(*bgp.PathAttributeMpReachNLRI).LinkLocalNexthop = ip("fe80::2")
+	path.PeerAddress = ip("fe80::2%v0")
+	s.HandleBestPaths([]*apiutil.Path{path})
+	rs := n.find(netlink.FAMILY_V6, "2001:db8:50::/48")
+	if len(rs) != 1 || rs[0].LinkIndex != n.ifindex("v0") {
+		t.Fatalf("not installed on v0: %v (stats %+v)", rs, s.Stats())
 	}
 }

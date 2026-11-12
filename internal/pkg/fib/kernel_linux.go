@@ -15,11 +15,14 @@
 package fib
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"slices"
+	"strconv"
+	"sync"
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
@@ -60,9 +63,16 @@ type KernelOptions struct {
 
 type kernelProgrammer struct {
 	h      *netlink.Handle
+	ns     *netns.NsHandle
 	table  int
 	proto  netlink.RouteProtocol
 	metric int
+
+	// Interface names and indexes of link-local next hops, so a route does not
+	// cost an extra netlink call. Cleared when a link changes.
+	mu    sync.Mutex
+	index map[string]int
+	name  map[int]string
 }
 
 // NewKernelProgrammer returns a Programmer that manages Linux kernel routes
@@ -99,7 +109,8 @@ func NewKernelProgrammer(o KernelOptions) (interface {
 	if err != nil {
 		return nil, fmt.Errorf("open netlink: %w", err)
 	}
-	return &kernelProgrammer{h: h, table: o.Table, proto: netlink.RouteProtocol(o.Protocol), metric: o.Metric}, nil
+	return &kernelProgrammer{h: h, ns: o.NetNS, table: o.Table, proto: netlink.RouteProtocol(o.Protocol), metric: o.Metric,
+		index: map[string]int{}, name: map[int]string{}}, nil
 }
 
 func (k *kernelProgrammer) Close() error {
@@ -116,22 +127,94 @@ func (k *kernelProgrammer) route(p netip.Prefix) *netlink.Route {
 	return &netlink.Route{Dst: ipNet(p), Table: k.table, Protocol: k.proto, Priority: k.metric}
 }
 
+// linkIndex finds the interface index for a zone: a name, or a number.
+func (k *kernelProgrammer) linkIndex(zone string) (int, error) {
+	if n, err := strconv.Atoi(zone); err == nil {
+		return n, nil
+	}
+	k.mu.Lock()
+	idx, ok := k.index[zone]
+	k.mu.Unlock()
+	if ok {
+		return idx, nil
+	}
+	l, err := k.h.LinkByName(zone)
+	if err != nil {
+		return 0, fmt.Errorf("%w: interface %q: %v", ErrNextHopUnreachable, zone, err)
+	}
+	idx = l.Attrs().Index
+	k.mu.Lock()
+	k.index[zone] = idx
+	k.name[idx] = zone
+	k.mu.Unlock()
+	return idx, nil
+}
+
+// zoneOf is the interface name for an index (the index itself if the link is
+// gone).
+func (k *kernelProgrammer) zoneOf(idx int) string {
+	k.mu.Lock()
+	name, ok := k.name[idx]
+	k.mu.Unlock()
+	if ok {
+		return name
+	}
+	l, err := k.h.LinkByIndex(idx)
+	if err != nil {
+		return strconv.Itoa(idx)
+	}
+	name = l.Attrs().Name
+	k.mu.Lock()
+	k.index[name] = idx
+	k.name[idx] = name
+	k.mu.Unlock()
+	return name
+}
+
+func (k *kernelProgrammer) clearLinkCache() {
+	k.mu.Lock()
+	clear(k.index)
+	clear(k.name)
+	k.mu.Unlock()
+}
+
+// gateway converts a next hop into its gateway address and interface index
+// (0 when the kernel should work the interface out itself).
+func (k *kernelProgrammer) gateway(h netip.Addr) (net.IP, int, error) {
+	if h.Is6() && h.IsLinkLocalUnicast() {
+		if h.Zone() == "" {
+			return nil, 0, fmt.Errorf("link-local next hop %s has no interface", h)
+		}
+		idx, err := k.linkIndex(h.Zone())
+		return net.IP(h.WithZone("").AsSlice()), idx, err
+	}
+	return net.IP(h.WithZone("").AsSlice()), 0, nil
+}
+
 func (k *kernelProgrammer) Replace(r Route) error {
 	if len(r.NextHops) == 0 {
 		return errors.New("route has no next hop")
 	}
 	nl := k.route(r.Prefix)
 	if len(r.NextHops) == 1 {
-		nl.Gw = net.IP(r.NextHops[0].AsSlice())
+		gw, idx, err := k.gateway(r.NextHops[0])
+		if err != nil {
+			return err
+		}
+		nl.Gw, nl.LinkIndex = gw, idx
 	} else {
 		// ECMP: one route with several next hops, replaced as a whole so the
 		// kernel never forwards over a half-updated set.
 		for _, h := range r.NextHops {
-			nl.MultiPath = append(nl.MultiPath, &netlink.NexthopInfo{Gw: net.IP(h.AsSlice())})
+			gw, idx, err := k.gateway(h)
+			if err != nil {
+				return err
+			}
+			nl.MultiPath = append(nl.MultiPath, &netlink.NexthopInfo{Gw: gw, LinkIndex: idx})
 		}
 	}
 	if err := k.h.RouteReplace(nl); err != nil {
-		if errors.Is(err, unix.ENETUNREACH) {
+		if errors.Is(err, unix.ENETUNREACH) || errors.Is(err, unix.ENODEV) {
 			return fmt.Errorf("%w: %v", ErrNextHopUnreachable, err)
 		}
 		return err
@@ -165,16 +248,153 @@ func (k *kernelProgrammer) ListOwned() ([]Route, error) {
 		var hops []netip.Addr
 		if len(r.MultiPath) > 0 {
 			for _, n := range r.MultiPath {
-				if a, ok := netip.AddrFromSlice(n.Gw); ok {
-					hops = append(hops, a.Unmap())
+				if a, ok := k.hopOf(n.Gw, n.LinkIndex); ok {
+					hops = append(hops, a)
 				}
 			}
-		} else if a, ok := netip.AddrFromSlice(r.Gw); ok {
-			hops = append(hops, a.Unmap())
+		} else if a, ok := k.hopOf(r.Gw, r.LinkIndex); ok {
+			hops = append(hops, a)
 		}
 		slices.SortFunc(hops, netip.Addr.Compare)
 		out = append(out, Route{Prefix: p, NextHops: hops})
 	}
+	return out, nil
+}
+
+// hopOf is gateway's inverse: a link-local gateway gets its interface back as
+// the zone, so what we list compares equal to what we asked for.
+func (k *kernelProgrammer) hopOf(gw net.IP, ifindex int) (netip.Addr, bool) {
+	a, ok := netip.AddrFromSlice(gw)
+	if !ok {
+		return netip.Addr{}, false
+	}
+	a = a.Unmap()
+	if a.Is6() && a.IsLinkLocalUnicast() && ifindex != 0 {
+		a = a.WithZone(k.zoneOf(ifindex))
+	}
+	return a, true
+}
+
+// Lookup finds our route for the prefix. The kernel can only list routes, not
+// fetch one by exact prefix, so this reads all of ours.
+func (k *kernelProgrammer) Lookup(p netip.Prefix) (Route, bool, error) {
+	owned, err := k.ListOwned()
+	if err != nil {
+		return Route{}, false, err
+	}
+	var out Route
+	found := false
+	for _, r := range owned {
+		if r.Prefix != p {
+			continue
+		}
+		found = true
+		out.Prefix = p
+		out.NextHops = append(out.NextHops, r.NextHops...)
+	}
+	slices.SortFunc(out.NextHops, netip.Addr.Compare)
+	return out, found, nil
+}
+
+// changeBuffer is how many Changes can wait for the syncer before some are
+// dropped (the syncer is then told to check everything).
+const changeBuffer = 256
+
+// Changes subscribes to route, address and link changes of the namespace we
+// program and turns them into Changes. Our own route installs are ignored;
+// the removal of one of our routes is reported with its prefix.
+//
+// The kernel drops routes silently when what they depend on goes away: when an
+// address is removed or a link goes down it deletes our routes through it
+// without sending a notification for them (it does for the connected route).
+// So an address, a link or a removed kernel route is reported as Resync, which
+// makes the syncer compare its routes with the kernel's in one pass.
+func (k *kernelProgrammer) Changes(ctx context.Context) (<-chan Change, error) {
+	done := make(chan struct{})
+	lost := make(chan struct{}, 1) // a subscription reported an error: events may be missing
+	onErr := func(error) {
+		select {
+		case lost <- struct{}{}:
+		default:
+		}
+	}
+	routes := make(chan netlink.RouteUpdate, changeBuffer)
+	addrs := make(chan netlink.AddrUpdate, changeBuffer)
+	links := make(chan netlink.LinkUpdate, changeBuffer)
+	const rcvbuf = 4 << 20 // a flush of a big table is a burst of route messages
+	if err := netlink.RouteSubscribeWithOptions(routes, done, netlink.RouteSubscribeOptions{Namespace: k.ns, ErrorCallback: onErr, ReceiveBufferSize: rcvbuf}); err != nil {
+		close(done)
+		return nil, err
+	}
+	if err := netlink.AddrSubscribeWithOptions(addrs, done, netlink.AddrSubscribeOptions{Namespace: k.ns, ErrorCallback: onErr}); err != nil {
+		close(done)
+		return nil, err
+	}
+	if err := netlink.LinkSubscribeWithOptions(links, done, netlink.LinkSubscribeOptions{Namespace: k.ns, ErrorCallback: onErr}); err != nil {
+		close(done)
+		return nil, err
+	}
+	out := make(chan Change, changeBuffer)
+	var dropped bool
+	send := func(c Change) {
+		if dropped {
+			// Tell the syncer first that it has missed something.
+			select {
+			case out <- Change{Resync: true}:
+				dropped = false
+			default:
+			}
+		}
+		select {
+		case out <- c:
+		default:
+			dropped = true
+		}
+	}
+	go func() {
+		defer close(out)
+		defer close(done)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-lost:
+				send(Change{Resync: true})
+			case u, ok := <-routes:
+				if !ok {
+					return
+				}
+				r := u.Route
+				if r.Table == k.table && r.Protocol == k.proto && r.Priority == k.metric {
+					if u.Type == unix.RTM_DELROUTE {
+						if p, ok := prefixOf(r); ok {
+							send(Change{Prefix: p})
+						}
+					}
+					continue
+				}
+				switch {
+				case u.Type == unix.RTM_NEWROUTE:
+					send(Change{Reach: true})
+				case r.Protocol == unix.RTPROT_KERNEL:
+					// A connected route went: routes through it may have been
+					// dropped without a word.
+					send(Change{Resync: true})
+				}
+			case u, ok := <-addrs:
+				if !ok {
+					return
+				}
+				send(Change{Reach: u.NewAddr, Resync: true})
+			case u, ok := <-links:
+				if !ok {
+					return
+				}
+				k.clearLinkCache()
+				send(Change{Reach: u.Attrs() != nil && u.Attrs().Flags&net.FlagUp != 0, Resync: true})
+			}
+		}
+	}()
 	return out, nil
 }
 

@@ -2,7 +2,7 @@
 
 `veloced -fib-sync` copies BGP best paths into the Linux kernel routing table, so
 the host actually forwards traffic along what BGP learned. GoBGP by itself only
-computes routes. Roadmap tasks E4-1 and E4-3 (ECMP); see [ROADMAP.md](../../ROADMAP.md) section E4 for
+computes routes. Roadmap tasks E4-1, E4-2 (next hop retry, recovery, link-local binding) and E4-3 (ECMP); see [ROADMAP.md](../../ROADMAP.md) section E4 for
 what is still to come.
 
 Source: [`internal/pkg/fib/`](../../internal/pkg/fib/), wired into
@@ -23,6 +23,7 @@ ip route show proto 201                                   # the routes veloced o
 | `-fib-metric` | 20 | route metric; must be at least 1 (see below) |
 | `-multipath` | off | keep every equal-cost BGP path, so the kernel route gets all their next hops (see ECMP) |
 | `-fib-max-paths` | 64 | most next hops in one ECMP route (used with `-multipath`) |
+| `-fib-retry-interval` | 30s | safety-net timer for retrying routes whose next hop was unreachable (0 turns it off; network changes always trigger a retry) |
 
 Peers are not configurable from a file yet (task E2-2); add them with the `gobgp`
 CLI against the daemon's gRPC API, for example `gobgp neighbor add 10.0.12.1 as 65001`.
@@ -49,6 +50,55 @@ CLI against the daemon's gRPC API, for example `gobgp neighbor add 10.0.12.1 as 
    - anything else (other address families, labeled or VPN prefixes): ignored.
 4. **Stop** (before `bgp` stops). It removes every route it installed and ignores
    events still in flight, so a late event cannot put a route back after cleanup.
+
+## Next hops that are not reachable, and routes the kernel drops (E4-2)
+
+The kernel only accepts a route whose gateway is on a connected network, and it
+removes routes behind our back. Both were found by probing a real kernel, not assumed:
+
+- **A gateway that is not reachable yet** is refused (`ENETUNREACH`). Before E4-2 the
+  route stayed missing until the next best path event for that prefix.
+- **When an address is removed or a link goes down, the kernel deletes our routes
+  through it, sends no notification for them, and does not bring them back** when the
+  address or link returns. (It notifies only for the connected, local and broadcast
+  routes.) Before E4-2 the daemon believed those routes were still installed.
+- **A link-local IPv6 gateway with no interface is refused** ("Egress device not
+  specified"), so IPv6 sessions over link-local addresses could not work at all.
+
+What `veloced` does about it:
+
+- **Retry.** A prefix whose next hop is unreachable is kept as *pending*, and tried again
+  when something that could fix it changes (a link comes up, an address or a route is
+  added), and on a timer (`-fib-retry-interval`) in case a notification was lost. The
+  warning and the `Unreachable` counter are once per outage, not per retry. A withdrawal
+  cancels the wait. Only "unreachable" is retried; other kernel errors will not fix
+  themselves. A partial ECMP route that is retried is replaced as a whole in one call,
+  and a refusal leaves it as it is, so a retry never flaps a working route.
+- **Recovery.** The syncer subscribes to netlink route, address and link changes of the
+  namespace it programs (`Syncer.Run`, started before the best path watch so nothing in
+  between is missed). Because the kernel drops routes silently, an address or link
+  change, or the removal of a kernel connected route, makes the syncer compare its
+  routes with the kernel's in **one pass** over our routes (`VerifyAll`), put back any
+  that are missing or changed (`Stats.Drifted`), and retry pending ones. If the next hop
+  is unreachable at that moment the prefix becomes pending and returns with the network.
+  Events are debounced (200 ms), so a link going down is handled once, not once per
+  route. If the notification buffer overflows, the syncer is told to check everything.
+  Installing our own routes does not cause any of this: only the removal of one of ours,
+  and foreign changes, are reported.
+- **Interface binding.** A link-local next hop is bound to the interface named in the
+  peer's address. GoBGP gives a peer reached over a link-local address a zone
+  (`fe80::1%eth1`); the syncer carries it on the next hop, and the Linux programmer turns
+  it into an interface index per next hop (so ECMP over two interfaces works), cached and
+  cleared on link changes. A zone can be a name or a number. A link-local next hop from a
+  peer with no zone is not programmed; the operator is warned once per peer. An interface
+  that does not exist is "unreachable", so the route is installed when it appears.
+
+**Not done: recursive resolution.** A next hop that is not on a connected network (for
+example an iBGP next hop several hops away) is not resolved through other routes; the
+kernel refuses it and it waits as pending. Zebra-style resolution (look the next hop up in
+the routing table and install the resolved gateway and interface, re-resolve when
+routes change) is a separate piece of work. eBGP over WireGuard or an ENI, the target
+deployments, has directly connected next hops.
 
 ## ECMP (multiple equal-cost paths)
 
@@ -159,6 +209,29 @@ again, and shrink it when one session drops. I checked the tests catch bugs by
 planting three: treating multipath events as best paths, applying per path instead of
 per event, and not removing duplicate next hops. Each made tests fail.
 
+E4-2 adds portable tests for retry (counted once per outage, not repeated while still
+unreachable, other failures not retried, a withdrawal cancels a retry, a partial route is
+retried without probing), drift repair (dropped, changed, next hop gone then back, one
+pass for many routes, nothing after shutdown), `Run` (restore on change, retry on a
+reachability change, retry on the timer, a burst handled with one pass, resync) and
+link-local binding. Kernel tests cover the link-local gateway being refused without an
+interface and bound with one (by name and by number), ECMP over two interfaces,
+`Lookup`, the notifications (our installs are silent; removal of ours, a foreign route,
+an address and a link up are reported), and the three recovery cases on a real kernel:
+address removed and re-added, link flap with an ECMP route, and a next hop whose network
+appears later. I planted five bugs (probing on every retry, ignoring changed next hops,
+counting every retry, never pending, zone not applied) and each made tests fail.
+
+**Live E4-2 test in the lab** (`lab/retry-demo.sh`, output in `lab/results/retry-live-test.txt`,
+16 checks, all pass): a prefix whose next hop network r2 does not have yet is not
+installed and is logged once; adding the network installs it; removing and re-adding the
+address and a link flap each drop and restore it; a prefix withdrawn while waiting is not
+installed later; SIGTERM leaves nothing. Then the r1-r2 session is replaced by an
+unnumbered one (`gobgp neighbor add interface eth1`) and an IPv6 prefix is installed
+`via fe80::... dev eth1`, which confirms against real GoBGP that the peer address carries
+the interface. (The `gobgp` CLI needs the peer in the kernel neighbor table first, so
+the script pings `ff02::1` on both ends.)
+
 **Live ECMP test in the lab** (`lab/ecmp-demo.sh`, output in `lab/results/ecmp-live-test.txt`,
 15 checks, all pass): r1 and r3 both advertise the same prefixes to r2, which runs
 `veloced -fib-sync -multipath`. A shared prefix is one kernel route with both next hops
@@ -188,9 +261,13 @@ meaning the current namespace) with a regression test of the default path.
 - **ECMP has no weights**, and uses one route per prefix with inline next hops, not
   kernel next hop objects (`nhid`). At 900k prefixes the per-prefix state of the
   syncer (paths, applied next hops) has not been measured (task E4-5).
-- **No next hop resolution** beyond what the kernel does (task E4-2). A next hop that is
-  not on a connected network is skipped, not retried when a route to it appears later;
-  it is installed when the next best path event for that prefix arrives.
+- **No recursive next hop resolution** (see above): next hops must be on a connected network.
+- **Recovery looks at all our routes.** Finding one route in the kernel means listing them
+  (the kernel cannot fetch a route by exact prefix), so a link or address change costs
+  one pass over our routes. At 900k routes that has not been measured (task E4-5). Changes
+  are debounced, so a burst is one pass.
+- Retry and recovery need the netlink subscription. If it cannot be set up, the daemon
+  refuses to start.
 - **No batching.** One netlink call per route; the 900k-route table has not been
   measured (task E4-5). The watcher queue is unbounded, so a slow kernel means memory
   grows, not that BGP slows down.

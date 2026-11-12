@@ -53,6 +53,12 @@ By default `feedgen` gives every prefix its own AS path (one prefix per UPDATE).
 
 Swaps `veloced -fib-sync` in for r2's daemon and checks r2's kernel table (see `../docs/veloceroute/fib.md`). Output of the last run: `results/fib-live-test.txt`.
 
+## Retry, recovery and link-local live test
+
+    ./retry-demo.sh /tmp/veloced-linux    # 16 checks; restores gobgpd on all routers afterwards
+
+r2 runs `veloced -fib-sync`; a next hop network appears later, an address is removed and re-added, a dummy link flaps, a waiting prefix is withdrawn, and the r1-r2 session becomes an unnumbered link-local one. Output of the last run: `results/retry-live-test.txt`.
+
 ## ECMP live test
 
     ./ecmp-demo.sh /tmp/veloced-linux     # 15 checks; restores gobgpd on all routers afterwards

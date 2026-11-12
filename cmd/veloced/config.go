@@ -24,6 +24,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/osrg/gobgp/v4/internal/pkg/fib"
 )
@@ -49,6 +50,9 @@ type config struct {
 	FibTable    int // routing table to program
 	FibMetric   int // route priority; see fib.KernelOptions.Metric
 	FibMaxPaths int // most next hops in one ECMP route (with -multipath)
+	// FibRetry is how often prefixes whose next hop is not reachable are
+	// retried even if no network change is seen; 0 turns the timer off.
+	FibRetry time.Duration
 }
 
 func parseFlags(args []string, errOut io.Writer) (*config, error) {
@@ -68,6 +72,7 @@ func parseFlags(args []string, errOut io.Writer) (*config, error) {
 	fs.IntVar(&c.FibMetric, "fib-metric", fib.DefaultMetric, "route metric; kept non-zero so a BGP route cannot replace a connected or static one")
 	fs.BoolVar(&c.Multipath, "multipath", false, "keep every equal-cost BGP path; with -fib-sync the kernel route gets all their next hops (ECMP)")
 	fs.IntVar(&c.FibMaxPaths, "fib-max-paths", fib.DefaultMaxNextHops, "most next hops in one ECMP kernel route (with -multipath and -fib-sync)")
+	fs.DurationVar(&c.FibRetry, "fib-retry-interval", fib.DefaultRetryInterval, "how often to retry routes whose next hop was not reachable, besides on network changes (0 turns the timer off)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -117,6 +122,9 @@ func (c *config) validate() error {
 		}
 		if c.FibMetric < 1 {
 			errs = append(errs, fmt.Errorf("-fib-metric %d must be at least 1", c.FibMetric))
+		}
+		if c.FibRetry < 0 {
+			errs = append(errs, fmt.Errorf("-fib-retry-interval %s must not be negative", c.FibRetry))
 		}
 		if c.FibMaxPaths < 1 {
 			errs = append(errs, fmt.Errorf("-fib-max-paths %d must be at least 1", c.FibMaxPaths))

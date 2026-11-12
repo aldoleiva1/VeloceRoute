@@ -280,6 +280,9 @@ func (f *fakeKernel) Delete(p netip.Prefix) error {
 	return nil
 }
 func (f *fakeKernel) ListOwned() ([]fib.Route, error) { return f.owned, nil }
+func (f *fakeKernel) Lookup(netip.Prefix) (fib.Route, bool, error) {
+	return fib.Route{}, false, nil
+}
 func (f *fakeKernel) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -430,5 +433,22 @@ func TestMultipathFlagReachesTheBgpEngine(t *testing.T) {
 		if r.Global.UseMultiplePaths != on {
 			t.Errorf("-multipath=%v but the engine has use-multiple-paths=%v", on, r.Global.UseMultiplePaths)
 		}
+	}
+}
+
+func TestFibRetryIntervalFlag(t *testing.T) {
+	c, err := parseFlags([]string{"-asn", "65001", "-router-id", "10.0.0.1"}, io.Discard)
+	if err != nil || c.FibRetry != fib.DefaultRetryInterval {
+		t.Fatalf("default: %+v %v", c, err)
+	}
+	if runtime.GOOS != "linux" {
+		return
+	}
+	base := []string{"-asn", "65001", "-router-id", "10.0.0.1", "-fib-sync"}
+	if c, err := parseFlags(append(append([]string{}, base...), "-fib-retry-interval", "0"), io.Discard); err != nil || c.FibRetry != 0 {
+		t.Fatalf("0 must turn the timer off: %+v %v", c, err)
+	}
+	if _, err := parseFlags(append(append([]string{}, base...), "-fib-retry-interval", "-1s"), io.Discard); err == nil {
+		t.Fatal("a negative interval must be refused")
 	}
 }

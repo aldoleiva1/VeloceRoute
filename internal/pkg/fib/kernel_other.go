@@ -40,7 +40,10 @@ type unsupported struct{}
 func (unsupported) Replace(Route) error         { return ErrKernelUnsupported }
 func (unsupported) Delete(netip.Prefix) error   { return ErrKernelUnsupported }
 func (unsupported) ListOwned() ([]Route, error) { return nil, ErrKernelUnsupported }
-func (unsupported) Close() error                { return nil }
+func (unsupported) Lookup(netip.Prefix) (Route, bool, error) {
+	return Route{}, false, ErrKernelUnsupported
+}
+func (unsupported) Close() error { return nil }
 
 func NewKernelProgrammer(KernelOptions) (interface {
 	Programmer

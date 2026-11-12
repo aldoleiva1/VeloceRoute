@@ -1,0 +1,29 @@
+== start: empty lab tables, veloced replaces gobgpd on r2 (r1 peer only)
+PASS  a normal prefix is installed
+PASS  a prefix with a next hop on a network we do not have is not installed
+PASS  each of the two was logged once, with the promise to retry
+== the next hop network appears
+PASS  the waiting route is installed by the retry
+PASS  the retry was logged
+PASS  the other waiting prefix (no network yet) is still not installed
+== the address under the next hop is removed and returns (the kernel drops the route silently)
+PASS  the route is gone while its next hop is unreachable
+PASS  veloced noticed the kernel had dropped it
+PASS  the unrelated route was not disturbed
+PASS  the route returns with the address
+== link flap
+PASS  link down: route is gone
+PASS  link up: route is back
+== a withdrawal cancels a waiting route
+PASS  a prefix withdrawn while waiting is not installed when its network appears
+== clean stop
+PASS  SIGTERM removes every route veloced installed
+== link-local next hop: replace the r1 session by an unnumbered one
+   r1 faces r2 on eth1, r2 faces r1 on eth1
+PASS  the IPv6 prefix learned over the unnumbered session is installed
+PASS  its next hop is a link-local address bound to the session interface
+== restore: restart gobgpd on all routers
+Peer         AS  Up/Down State       |#Received  Accepted
+10.0.12.1 65001 00:00:06 Establ      |        0         0
+10.0.23.2 65003 00:00:06 Establ      |        0         0
+== 16 passed, 0 failed

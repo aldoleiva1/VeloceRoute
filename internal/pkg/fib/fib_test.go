@@ -15,6 +15,7 @@
 package fib
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/osrg/gobgp/v4/pkg/apiutil"
 	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
@@ -31,13 +33,15 @@ import (
 
 // fakeProg records calls and keeps the table it would have programmed.
 type fakeProg struct {
-	mu      sync.Mutex // the real-server tests read the table while the watcher writes it
-	table   map[netip.Prefix][]netip.Addr
-	calls   []string
-	replace map[netip.Prefix]error // injected Replace errors
-	hook    func(Route) error      // injected Replace errors by route (checked first)
-	delErr  map[netip.Prefix]error // injected Delete errors
-	owned   []Route                // returned by ListOwned
+	mu        sync.Mutex // the real-server tests read the table while the watcher writes it
+	table     map[netip.Prefix][]netip.Addr
+	calls     []string
+	replace   map[netip.Prefix]error // injected Replace errors
+	hook      func(Route) error      // injected Replace errors by route (checked first)
+	lookupErr error
+	listCalls int
+	delErr    map[netip.Prefix]error // injected Delete errors
+	owned     []Route                // returned by ListOwned
 }
 
 func newFake() *fakeProg {
@@ -71,7 +75,54 @@ func (f *fakeProg) Delete(p netip.Prefix) error {
 	return nil
 }
 
-func (f *fakeProg) ListOwned() ([]Route, error) { return f.owned, nil }
+func (f *fakeProg) ListOwned() ([]Route, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listCalls++
+	if f.owned != nil {
+		return f.owned, nil
+	}
+	var out []Route
+	for p, h := range f.table {
+		out = append(out, Route{Prefix: p, NextHops: h})
+	}
+	return out, nil
+}
+
+// drop removes a route behind the syncer's back, as the kernel does when an
+// address goes away.
+func (f *fakeProg) drop(p netip.Prefix) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.table, p)
+}
+
+func (f *fakeProg) setHook(h func(Route) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hook = h
+}
+
+func (f *fakeProg) replaceCalls() (n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "replace") {
+			n++
+		}
+	}
+	return n
+}
+
+func (f *fakeProg) Lookup(p netip.Prefix) (Route, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.lookupErr != nil {
+		return Route{}, false, f.lookupErr
+	}
+	hops, ok := f.table[p]
+	return Route{Prefix: p, NextHops: hops}, ok, nil
+}
 
 func (f *fakeProg) callLog() string { return strings.Join(f.calls, "; ") }
 
@@ -169,12 +220,34 @@ func TestIPv6AndLinkLocalNextHop(t *testing.T) {
 	if got := f.routes(); got != "2001:db8:1::/48>2001:db8::2" {
 		t.Fatalf("v6: %s", got)
 	}
-	// A peer with only a link-local next hop.
+	// A peer with only a link-local next hop, reached over eth1: the next hop is
+	// bound to that interface.
 	p := v6(t, "2001:db8:2::/48", "::")
 	p.Attrs[0].(*bgp.PathAttributeMpReachNLRI).LinkLocalNexthop = netip.MustParseAddr("fe80::1")
+	p.PeerAddress = netip.MustParseAddr("fe80::1%eth1")
 	s.HandleBestPaths([]*apiutil.Path{p})
-	if got := f.table[netip.MustParsePrefix("2001:db8:2::/48")]; len(got) != 1 || got[0] != netip.MustParseAddr("fe80::1") {
+	if got := f.table[netip.MustParsePrefix("2001:db8:2::/48")]; len(got) != 1 || got[0] != netip.MustParseAddr("fe80::1%eth1") {
 		t.Fatalf("link-local next hop: %v", got)
+	}
+}
+
+// Without an interface a link-local next hop means nothing and the kernel
+// refuses it, so it is not programmed, and the operator is told once per peer.
+func TestLinkLocalNextHopWithoutInterfaceIsNotProgrammed(t *testing.T) {
+	f := newFake()
+	var logs strings.Builder
+	s := NewSyncer(f, slog.New(slog.NewTextHandler(&logs, nil)))
+	for _, prefix := range []string{"2001:db8:2::/48", "2001:db8:3::/48"} {
+		p := v6(t, prefix, "::")
+		p.Attrs[0].(*bgp.PathAttributeMpReachNLRI).LinkLocalNexthop = netip.MustParseAddr("fe80::1")
+		p.PeerAddress = netip.MustParseAddr("fe80::1") // no zone
+		s.HandleBestPaths([]*apiutil.Path{p})
+	}
+	if len(f.calls) != 0 || s.Stats().Skipped != 2 {
+		t.Fatalf("programmed: %s stats=%+v", f.callLog(), s.Stats())
+	}
+	if n := strings.Count(logs.String(), "no interface"); n != 1 {
+		t.Fatalf("want one warning for the peer, got %d:\n%s", n, logs.String())
 	}
 }
 
@@ -617,5 +690,305 @@ func TestReconcileDeletesAPrefixListedPerNextHopOnce(t *testing.T) {
 	}
 	if f.callLog() != "delete 192.0.2.0/24" {
 		t.Fatalf("calls: %s", f.callLog())
+	}
+}
+
+// ---- retry, drift repair and link-local binding (task E4-2) ----
+
+func TestRetryInstallsOnceTheNextHopIsReachable(t *testing.T) {
+	f := newFake()
+	f.hook = unreachableHops("172.31.255.1")
+	s := NewSyncer(f, quiet())
+	s.HandleBestPaths([]*apiutil.Path{v4(t, "192.0.2.0/24", "172.31.255.1")})
+	if st := s.Stats(); st.Installed != 0 || st.Unreachable != 1 {
+		t.Fatalf("%+v", st)
+	}
+	// Still unreachable: nothing changes, nothing is counted again.
+	s.RetryPending()
+	s.RetryPending()
+	if st := s.Stats(); st.Installed != 0 || st.Unreachable != 1 || st.Errors != 0 {
+		t.Fatalf("retry while unreachable: %+v", st)
+	}
+	f.setHook(nil) // the network came up
+	s.RetryPending()
+	if got := f.routes(); got != "192.0.2.0/24>172.31.255.1" {
+		t.Fatalf("route not installed by the retry: %s", got)
+	}
+	if st := s.Stats(); st.Installed != 1 || st.Recovered != 1 {
+		t.Fatalf("%+v", st)
+	}
+	n := len(f.calls)
+	s.RetryPending() // nothing pending any more
+	if len(f.calls) != n {
+		t.Fatalf("idle retry made kernel calls: %s", f.callLog())
+	}
+}
+
+// A refusal that is not "unreachable" will not fix itself, so it is not retried.
+func TestRetryIgnoresOtherFailures(t *testing.T) {
+	f := newFake()
+	f.hook = func(Route) error { return errors.New("boom") }
+	s := NewSyncer(f, quiet())
+	s.HandleBestPaths([]*apiutil.Path{v4(t, "192.0.2.0/24", "10.0.0.2")})
+	n := len(f.calls)
+	s.RetryPending()
+	if len(f.calls) != n {
+		t.Fatalf("retried a failure that is not about reachability: %s", f.callLog())
+	}
+}
+
+func TestWithdrawalCancelsARetry(t *testing.T) {
+	f := newFake()
+	f.hook = unreachableHops("172.31.255.1")
+	s := NewSyncer(f, quiet())
+	p := v4(t, "192.0.2.0/24", "172.31.255.1")
+	s.HandleBestPaths([]*apiutil.Path{p})
+	s.HandleBestPaths([]*apiutil.Path{withdrawn(p)})
+	f.setHook(nil)
+	s.RetryPending()
+	if f.routes() != "" {
+		t.Fatalf("a withdrawn prefix was installed by a retry: %s", f.routes())
+	}
+}
+
+// A retry of a route that is already installed with fewer next hops must not
+// probe next hop by next hop: that would flap the route every time it runs.
+func TestRetryOfPartialRouteDoesNotProbe(t *testing.T) {
+	f := newFake()
+	f.hook = unreachableHops("172.31.255.1")
+	s := newMulti(f, 0)
+	s.HandleBestPaths([]*apiutil.Path{
+		from(v4(t, "192.0.2.0/24", "10.0.0.2"), "10.0.0.2"),
+		from(v4(t, "192.0.2.0/24", "172.31.255.1"), "10.0.0.3"),
+		from(v4(t, "192.0.2.0/24", "10.0.0.4"), "10.0.0.4"),
+	})
+	if got := f.routes(); got != "192.0.2.0/24>10.0.0.2+10.0.0.4" {
+		t.Fatalf("route: %s", got)
+	}
+	before := f.replaceCalls()
+	s.RetryPending()
+	if d := f.replaceCalls() - before; d != 1 {
+		t.Fatalf("a retry of a partial route made %d replace calls, want 1: %s", d, f.callLog())
+	}
+	if got := f.routes(); got != "192.0.2.0/24>10.0.0.2+10.0.0.4" {
+		t.Fatalf("route changed by a retry that could not improve it: %s", got)
+	}
+	f.setHook(nil)
+	s.RetryPending()
+	if got := f.routes(); got != "192.0.2.0/24>10.0.0.2+10.0.0.4+172.31.255.1" {
+		t.Fatalf("route did not grow to all next hops: %s", got)
+	}
+	if st := s.Stats(); st.Recovered != 1 || st.Installed != 1 {
+		t.Fatalf("%+v", st)
+	}
+}
+
+func TestVerifyRestoresARouteTheKernelDropped(t *testing.T) {
+	f := newFake()
+	s := NewSyncer(f, quiet())
+	pf := netip.MustParsePrefix("192.0.2.0/24")
+	s.HandleBestPaths([]*apiutil.Path{v4(t, "192.0.2.0/24", "10.0.0.2")})
+	// Intact: a check changes nothing.
+	n := f.replaceCalls()
+	s.Verify(pf)
+	if f.replaceCalls() != n || s.Stats().Drifted != 0 {
+		t.Fatalf("verify touched an intact route: %s", f.callLog())
+	}
+	f.drop(pf)
+	s.Verify(pf)
+	if got := f.routes(); got != "192.0.2.0/24>10.0.0.2" {
+		t.Fatalf("route not restored: %s", got)
+	}
+	if st := s.Stats(); st.Drifted != 1 || st.Installed != 1 {
+		t.Fatalf("%+v", st)
+	}
+	// A prefix we do not track is left alone.
+	s.Verify(netip.MustParsePrefix("198.51.100.0/24"))
+}
+
+func TestVerifyRestoresARouteSomeoneChanged(t *testing.T) {
+	f := newFake()
+	s := NewSyncer(f, quiet())
+	s.HandleBestPaths([]*apiutil.Path{v4(t, "192.0.2.0/24", "10.0.0.2")})
+	f.mu.Lock()
+	f.table[netip.MustParsePrefix("192.0.2.0/24")] = []netip.Addr{netip.MustParseAddr("10.0.0.99")}
+	f.mu.Unlock()
+	s.VerifyAll()
+	if got := f.routes(); got != "192.0.2.0/24>10.0.0.2" {
+		t.Fatalf("route not put back: %s", got)
+	}
+}
+
+// The case that started this task: an address goes away, the kernel drops the
+// route through it, the address comes back, and the route must return.
+func TestDroppedRouteWhoseNextHopIsGoneComesBackWhenItReturns(t *testing.T) {
+	f := newFake()
+	s := NewSyncer(f, quiet())
+	pf := netip.MustParsePrefix("192.0.2.0/24")
+	s.HandleBestPaths([]*apiutil.Path{v4(t, "192.0.2.0/24", "10.0.0.2")})
+	f.drop(pf)
+	f.setHook(unreachableHops("10.0.0.2")) // the address is gone
+	s.Verify(pf)
+	if st := s.Stats(); st.Installed != 0 || st.Drifted != 1 {
+		t.Fatalf("%+v", st)
+	}
+	f.setHook(nil) // the address is back
+	s.RetryPending()
+	if got := f.routes(); got != "192.0.2.0/24>10.0.0.2" {
+		t.Fatalf("route did not come back: %s", got)
+	}
+	if st := s.Stats(); st.Installed != 1 || st.Recovered != 1 {
+		t.Fatalf("%+v", st)
+	}
+}
+
+func TestVerifyAllNeedsOnePassOverTheKernelRoutes(t *testing.T) {
+	f := newFake()
+	s := NewSyncer(f, quiet())
+	for _, p := range []string{"192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"} {
+		s.HandleBestPaths([]*apiutil.Path{v4(t, p, "10.0.0.2")})
+	}
+	f.drop(netip.MustParsePrefix("192.0.2.0/24"))
+	f.drop(netip.MustParsePrefix("203.0.113.0/24"))
+	f.mu.Lock()
+	f.listCalls = 0
+	f.mu.Unlock()
+	s.VerifyAll()
+	f.mu.Lock()
+	lists := f.listCalls
+	f.mu.Unlock()
+	if lists != 1 {
+		t.Fatalf("VerifyAll listed the kernel %d times", lists)
+	}
+	if st := s.Stats(); st.Drifted != 2 || st.Installed != 3 {
+		t.Fatalf("%+v", st)
+	}
+	if got := f.routes(); got != "192.0.2.0/24>10.0.0.2,198.51.100.0/24>10.0.0.2,203.0.113.0/24>10.0.0.2" {
+		t.Fatalf("routes: %s", got)
+	}
+}
+
+func TestNothingRunsAfterRemoveAll(t *testing.T) {
+	f := newFake()
+	f.hook = unreachableHops("172.31.255.1")
+	s := NewSyncer(f, quiet())
+	s.HandleBestPaths([]*apiutil.Path{v4(t, "192.0.2.0/24", "172.31.255.1")})
+	s.HandleBestPaths([]*apiutil.Path{v4(t, "198.51.100.0/24", "10.0.0.2")})
+	if err := s.RemoveAll(); err != nil {
+		t.Fatal(err)
+	}
+	f.setHook(nil)
+	s.RetryPending()
+	s.Verify(netip.MustParsePrefix("198.51.100.0/24"))
+	s.VerifyAll()
+	if f.routes() != "" {
+		t.Fatalf("routes came back after shutdown: %s", f.routes())
+	}
+}
+
+type fakeChanges struct {
+	ch  chan Change
+	err error
+}
+
+func (c *fakeChanges) Changes(context.Context) (<-chan Change, error) { return c.ch, c.err }
+
+func startRun(t *testing.T, s *Syncer, retryEvery time.Duration) *fakeChanges {
+	t.Helper()
+	src := &fakeChanges{ch: make(chan Change, 16)}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := s.Run(ctx, src, retryEvery); err != nil {
+		t.Fatal(err)
+	}
+	return src
+}
+
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestRunRestoresDroppedRouteOnChange(t *testing.T) {
+	f := newFake()
+	s := NewSyncer(f, quiet(), WithDebounce(5*time.Millisecond))
+	src := startRun(t, s, 0)
+	pf := netip.MustParsePrefix("192.0.2.0/24")
+	s.HandleBestPaths([]*apiutil.Path{v4(t, "192.0.2.0/24", "10.0.0.2")})
+	f.drop(pf)
+	src.ch <- Change{Prefix: pf}
+	eventually(t, "the dropped route to be restored", func() bool { return f.routes() == "192.0.2.0/24>10.0.0.2" })
+}
+
+func TestRunRetriesOnReachabilityChange(t *testing.T) {
+	f := newFake()
+	f.hook = unreachableHops("172.31.255.1")
+	s := NewSyncer(f, quiet(), WithDebounce(5*time.Millisecond))
+	src := startRun(t, s, 0)
+	s.HandleBestPaths([]*apiutil.Path{v4(t, "192.0.2.0/24", "172.31.255.1")})
+	f.setHook(nil)
+	src.ch <- Change{Reach: true}
+	eventually(t, "the retry", func() bool { return f.routes() == "192.0.2.0/24>172.31.255.1" })
+}
+
+func TestRunRetriesOnTheTimerWithoutAnyChange(t *testing.T) {
+	f := newFake()
+	f.hook = unreachableHops("172.31.255.1")
+	s := NewSyncer(f, quiet())
+	startRun(t, s, 10*time.Millisecond)
+	s.HandleBestPaths([]*apiutil.Path{v4(t, "192.0.2.0/24", "172.31.255.1")})
+	f.setHook(nil)
+	eventually(t, "the timer retry", func() bool { return f.routes() == "192.0.2.0/24>172.31.255.1" })
+}
+
+// A burst (a link going down drops every route through it) is one full check,
+// not one table pass per prefix.
+func TestRunHandlesABurstWithOnePass(t *testing.T) {
+	f := newFake()
+	s := NewSyncer(f, quiet(), WithDebounce(50*time.Millisecond))
+	src := startRun(t, s, 0)
+	var ps []netip.Prefix
+	for i := 0; i < 6; i++ {
+		pf := netip.MustParsePrefix(fmt.Sprintf("192.0.2.%d/32", i))
+		ps = append(ps, pf)
+		s.HandleBestPaths([]*apiutil.Path{v4(t, pf.String(), "10.0.0.2")})
+	}
+	f.mu.Lock()
+	f.listCalls = 0
+	f.mu.Unlock()
+	for _, pf := range ps {
+		f.drop(pf)
+		src.ch <- Change{Prefix: pf}
+	}
+	eventually(t, "all routes restored", func() bool { return s.Stats().Drifted == 6 && s.Stats().Installed == 6 })
+	f.mu.Lock()
+	lists := f.listCalls
+	f.mu.Unlock()
+	if lists != 1 {
+		t.Fatalf("the burst needed %d passes over the kernel routes, want 1", lists)
+	}
+}
+
+func TestRunResyncChecksEverything(t *testing.T) {
+	f := newFake()
+	s := NewSyncer(f, quiet(), WithDebounce(5*time.Millisecond))
+	src := startRun(t, s, 0)
+	s.HandleBestPaths([]*apiutil.Path{v4(t, "192.0.2.0/24", "10.0.0.2")})
+	f.drop(netip.MustParsePrefix("192.0.2.0/24"))
+	src.ch <- Change{Resync: true}
+	eventually(t, "the resync to restore the route", func() bool { return f.routes() == "192.0.2.0/24>10.0.0.2" })
+}
+
+func TestRunFailsIfItCannotSubscribe(t *testing.T) {
+	s := NewSyncer(newFake(), quiet())
+	err := s.Run(context.Background(), &fakeChanges{err: errors.New("no netlink")}, 0)
+	if err == nil || !strings.Contains(err.Error(), "no netlink") {
+		t.Fatalf("err = %v", err)
 	}
 }

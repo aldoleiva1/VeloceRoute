@@ -151,6 +151,16 @@ func fibStage(cfg *config, logger *slog.Logger, d *daemon, k kernelRoutes) stage
 			// run context, decides when it ends.
 			var wctx context.Context
 			wctx, cancel = context.WithCancel(context.WithoutCancel(ctx))
+			// Watch the network before the BGP events, so nothing that happens
+			// in between is missed: routes the kernel drops are restored and
+			// routes waiting for a next hop are retried.
+			if src, ok := prog.(fib.ChangeSource); ok {
+				if err := syn.Run(wctx, src, cfg.FibRetry); err != nil {
+					cancel()
+					prog.Close()
+					return err
+				}
+			}
 			if err := syn.Watch(wctx, d.bgp); err != nil {
 				cancel()
 				prog.Close()
