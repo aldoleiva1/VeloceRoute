@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net/netip"
 	"sort"
 	"strings"
@@ -990,5 +991,285 @@ func TestRunFailsIfItCannotSubscribe(t *testing.T) {
 	err := s.Run(context.Background(), &fakeChanges{err: errors.New("no netlink")}, 0)
 	if err == nil || !strings.Contains(err.Error(), "no netlink") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// ---- batching and the event queue (task E4-5) ----
+
+// fakeBatch is a fake programmer that can also take a batch. It applies the ops
+// one by one with the fake's own Replace and Delete, so the two paths can be
+// compared.
+type fakeBatch struct {
+	*fakeProg
+	mu2     sync.Mutex
+	sizes   []int
+	delay   time.Duration
+	applyFn func([]Op) // test hook
+}
+
+func newFakeBatch() *fakeBatch { return &fakeBatch{fakeProg: newFake()} }
+
+func (f *fakeBatch) Apply(ops []Op) []error {
+	if f.delay > 0 {
+		time.Sleep(f.delay)
+	}
+	f.mu2.Lock()
+	f.sizes = append(f.sizes, len(ops))
+	f.mu2.Unlock()
+	errs := make([]error, len(ops))
+	for i, op := range ops {
+		if op.Delete {
+			errs[i] = f.Delete(op.Route.Prefix)
+		} else {
+			errs[i] = f.Replace(op.Route)
+		}
+	}
+	return errs
+}
+
+func (f *fakeBatch) batchSizes() []int {
+	f.mu2.Lock()
+	defer f.mu2.Unlock()
+	return append([]int(nil), f.sizes...)
+}
+
+func manyPaths(t testing.TB, n int, nh string) []*apiutil.Path {
+	var ps []*apiutil.Path
+	for i := 0; i < n; i++ {
+		ps = append(ps, v4(t, fmt.Sprintf("10.%d.%d.0/24", i/256, i%256), nh))
+	}
+	return ps
+}
+
+func TestManyChangesGoInOneBatch(t *testing.T) {
+	f := newFakeBatch()
+	s := NewSyncer(f, quiet())
+	s.HandleBestPaths(manyPaths(t, 100, "10.0.0.2"))
+	if got := f.batchSizes(); len(got) != 1 || got[0] != 100 {
+		t.Fatalf("batches %v, want one of 100", got)
+	}
+	if st := s.Stats(); st.Installed != 100 || st.Replaced != 100 || st.Batches != 1 || st.BatchedOps != 100 {
+		t.Fatalf("%+v", st)
+	}
+	// Unchanged paths are not sent again.
+	s.HandleBestPaths(manyPaths(t, 100, "10.0.0.2"))
+	if got := f.batchSizes(); len(got) != 1 {
+		t.Fatalf("an unchanged event caused a batch: %v", got)
+	}
+	// Withdrawing all of them is one batch of deletes.
+	var w []*apiutil.Path
+	for _, p := range manyPaths(t, 100, "10.0.0.2") {
+		w = append(w, withdrawn(p))
+	}
+	s.HandleBestPaths(w)
+	if got := f.batchSizes(); len(got) != 2 || got[1] != 100 {
+		t.Fatalf("batches %v", got)
+	}
+	if st := s.Stats(); st.Installed != 0 || st.Deleted != 100 || f.routes() != "" {
+		t.Fatalf("%+v %s", st, f.routes())
+	}
+}
+
+func TestOneChangeIsNotWorthABatch(t *testing.T) {
+	f := newFakeBatch()
+	s := NewSyncer(f, quiet())
+	s.HandleBestPaths(manyPaths(t, 1, "10.0.0.2"))
+	if len(f.batchSizes()) != 0 || f.routes() == "" {
+		t.Fatalf("batches %v routes %q", f.batchSizes(), f.routes())
+	}
+}
+
+// A refusal inside a batch is handled exactly as it is without batching: the
+// others are installed, the refused one waits for its next hop.
+func TestRefusedChangeInABatchIsHandledAsUsual(t *testing.T) {
+	f := newFakeBatch()
+	f.hook = unreachableHops("172.31.255.1")
+	s := NewSyncer(f, quiet())
+	ps := manyPaths(t, 5, "10.0.0.2")
+	ps[2] = v4(t, "10.0.2.0/24", "172.31.255.1")
+	s.HandleBestPaths(ps)
+	if st := s.Stats(); st.Installed != 4 || st.Unreachable != 1 || st.Errors != 0 {
+		t.Fatalf("%+v", st)
+	}
+	f.setHook(nil)
+	s.RetryPending()
+	if st := s.Stats(); st.Installed != 5 || st.Recovered != 1 {
+		t.Fatalf("after retry %+v", st)
+	}
+}
+
+func TestPartialEcmpRouteInABatch(t *testing.T) {
+	f := newFakeBatch()
+	f.hook = unreachableHops("172.31.255.1")
+	s := NewSyncer(f, quiet(), WithMultipath(0))
+	var ps []*apiutil.Path
+	ps = append(ps, from(v4(t, "192.0.2.0/24", "10.0.0.2"), "10.0.0.2"), from(v4(t, "192.0.2.0/24", "172.31.255.1"), "10.0.0.3"), from(v4(t, "192.0.2.0/24", "10.0.0.4"), "10.0.0.4"))
+	ps = append(ps, manyPaths(t, 4, "10.0.0.2")...)
+	s.HandleBestPaths(ps)
+	if got := f.table[netip.MustParsePrefix("192.0.2.0/24")]; len(got) != 2 {
+		t.Fatalf("partial route: %v", got)
+	}
+	if st := s.Stats(); st.Installed != 5 || st.Unreachable != 1 {
+		t.Fatalf("%+v", st)
+	}
+}
+
+func TestFailedDeleteInABatchStaysTracked(t *testing.T) {
+	f := newFakeBatch()
+	s := NewSyncer(f, quiet())
+	s.HandleBestPaths(manyPaths(t, 4, "10.0.0.2"))
+	f.delErr[netip.MustParsePrefix("10.0.1.0/24")] = errors.New("busy")
+	var w []*apiutil.Path
+	for _, p := range manyPaths(t, 4, "10.0.0.2") {
+		w = append(w, withdrawn(p))
+	}
+	s.HandleBestPaths(w)
+	if st := s.Stats(); st.Installed != 1 || st.Errors != 1 {
+		t.Fatalf("%+v", st)
+	}
+	delete(f.delErr, netip.MustParsePrefix("10.0.1.0/24"))
+	if err := s.RemoveAll(); err != nil || f.routes() != "" {
+		t.Fatalf("RemoveAll: %v %s", err, f.routes())
+	}
+}
+
+func TestReconcileAndRemoveAllUseBatches(t *testing.T) {
+	f := newFakeBatch()
+	for i := 0; i < 20; i++ {
+		pf := netip.MustParsePrefix(fmt.Sprintf("10.9.%d.0/24", i))
+		f.table[pf] = []netip.Addr{netip.MustParseAddr("10.0.0.2")}
+		f.owned = append(f.owned, Route{Prefix: pf, NextHops: []netip.Addr{netip.MustParseAddr("10.0.0.2")}})
+	}
+	s := NewSyncer(f, quiet())
+	if err := s.Reconcile(); err != nil || f.routes() != "" {
+		t.Fatalf("Reconcile: %v %s", err, f.routes())
+	}
+	if got := f.batchSizes(); len(got) != 1 || got[0] != 20 {
+		t.Fatalf("Reconcile batches: %v", got)
+	}
+	f.owned = nil
+	s.HandleBestPaths(manyPaths(t, 30, "10.0.0.2"))
+	if err := s.RemoveAll(); err != nil || f.routes() != "" {
+		t.Fatalf("RemoveAll: %v", err)
+	}
+	if got := f.batchSizes(); len(got) != 3 || got[2] != 30 {
+		t.Fatalf("RemoveAll batches: %v", got)
+	}
+}
+
+// Batching must not change the outcome: the same random events give the same
+// kernel table and the same counters with and without it.
+func TestBatchingGivesTheSameResultAsOneAtATime(t *testing.T) {
+	for _, multipath := range []bool{false, true} {
+		rnd := rand.New(rand.NewSource(7))
+		single, batch := newFake(), newFakeBatch()
+		var opts []Option
+		if multipath {
+			opts = append(opts, WithMultipath(3))
+		}
+		a := NewSyncer(single, quiet(), opts...)
+		b := NewSyncer(batch, quiet(), opts...)
+		bad := func(r Route) error {
+			for _, h := range r.NextHops {
+				if h == netip.MustParseAddr("172.31.255.1") {
+					return fmt.Errorf("%w: unreachable", ErrNextHopUnreachable)
+				}
+			}
+			return nil
+		}
+		single.hook, batch.hook = bad, bad
+		hops := []string{"10.0.0.2", "10.0.0.3", "10.0.0.4", "172.31.255.1"}
+		peers := []string{"10.0.0.2", "10.0.0.3", "10.0.0.4"}
+		for round := 0; round < 400; round++ {
+			var evs []*apiutil.Path
+			for n := rnd.Intn(8) + 1; n > 0; n-- {
+				pf := fmt.Sprintf("10.1.%d.0/24", rnd.Intn(12))
+				peer := peers[rnd.Intn(len(peers))]
+				p := from(v4(t, pf, hops[rnd.Intn(len(hops))]), peer)
+				if rnd.Intn(4) == 0 {
+					p = withdrawn(p)
+				}
+				evs = append(evs, p)
+			}
+			a.HandleBestPaths(evs)
+			b.HandleBestPaths(evs)
+			if round%25 == 0 {
+				a.RetryPending()
+				b.RetryPending()
+			}
+			if single.routes() != batch.routes() {
+				t.Fatalf("multipath=%v round %d: tables differ\nsingle: %s\nbatch:  %s", multipath, round, single.routes(), batch.routes())
+			}
+		}
+		sa, sb := a.Stats(), b.Stats()
+		sb.Batches, sb.BatchedOps = 0, 0
+		if sa != sb {
+			t.Fatalf("multipath=%v: counters differ\nsingle: %+v\nbatch:  %+v", multipath, sa, sb)
+		}
+		if len(batch.batchSizes()) == 0 {
+			t.Fatal("the batch path was never used")
+		}
+	}
+}
+
+// Events queue while the writer is busy and are applied together: the slower
+// the kernel, the bigger the batches, and the order of events is kept.
+func TestQueueAppliesEventsInOrderAndInBigBatches(t *testing.T) {
+	f := newFakeBatch()
+	f.delay = 20 * time.Millisecond
+	s := NewSyncer(f, quiet())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.drain(ctx)
+
+	for i := 0; i < 60; i++ {
+		s.Submit(manyPaths(t, 3, fmt.Sprintf("10.0.0.%d", 2+i%2)))
+		s.Submit([]*apiutil.Path{v4(t, "192.0.2.0/24", "10.0.0.2")})
+	}
+	// add then withdraw the same prefix: the end state is "absent".
+	s.Submit([]*apiutil.Path{v4(t, "198.51.100.0/24", "10.0.0.2")})
+	s.Submit([]*apiutil.Path{withdrawn(v4(t, "198.51.100.0/24", "10.0.0.2"))})
+	// The last path for these three has next hop 10.0.0.3 (i = 59, odd).
+	eventually(t, "the queue to be applied", func() bool {
+		return f.routes() == "10.0.0.0/24>10.0.0.3,10.0.1.0/24>10.0.0.3,10.0.2.0/24>10.0.0.3,192.0.2.0/24>10.0.0.2"
+	})
+	sizes := f.batchSizes()
+	if len(sizes) >= 100 {
+		t.Fatalf("every event made its own call: %d batches", len(sizes))
+	}
+	if s.QueuePeak() < 2 {
+		t.Fatalf("nothing ever queued up: peak %d", s.QueuePeak())
+	}
+}
+
+func TestQueueStopsWithItsContext(t *testing.T) {
+	f := newFakeBatch()
+	s := NewSyncer(f, quiet())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { s.drain(ctx); close(done) }()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("drain did not stop")
+	}
+}
+
+func TestNothingIsAppliedFromTheQueueAfterRemoveAll(t *testing.T) {
+	f := newFakeBatch()
+	s := NewSyncer(f, quiet())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.drain(ctx)
+	s.Submit(manyPaths(t, 5, "10.0.0.2"))
+	eventually(t, "the first events", func() bool { return s.Stats().Installed == 5 })
+	if err := s.RemoveAll(); err != nil {
+		t.Fatal(err)
+	}
+	s.Submit(manyPaths(t, 5, "10.0.0.3"))
+	time.Sleep(100 * time.Millisecond)
+	if f.routes() != "" {
+		t.Fatalf("routes installed after RemoveAll: %s", f.routes())
 	}
 }

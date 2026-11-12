@@ -53,6 +53,15 @@ By default `feedgen` gives every prefix its own AS path (one prefix per UPDATE).
 
 Swaps `veloced -fib-sync` in for r2's daemon and checks r2's kernel table (see `../docs/veloceroute/fib.md`). Output of the last run: `results/fib-live-test.txt`.
 
+## Bulk programming at 900k
+
+    CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /tmp/veloced-linux ../cmd/veloced
+    FEEDGEN_ARGS="-share 40" ./fib-bulk.sh <label> /tmp/veloced-linux [N]   # NO_FIB=1 for the control without kernel sync
+    ./summarize-bulk.sh results/<label>-*.txt                                # table of runs
+    FEEDGEN_ARGS="-share 40" ./fib-profile.sh <label> /tmp/veloced-linux     # CPU, heap and allocs profiles in results/prof/
+
+`fib-bulk.sh` injects N routes from r1, runs `veloced -fib-sync` on r2, and times BGP convergence and the kernel table (read from `/proc/net/fib_triestat`), plus veloced's CPU, peak memory and the time for SIGTERM to remove every route. Env: `VELOCED_ARGS`, `VELOCED_ENV` (for example `GOGC=200`). Results: `results/bulk-*`, `results/bulkfinal-*`, `results/fibbulk-before-*`.
+
 ## Retry, recovery and link-local live test
 
     ./retry-demo.sh /tmp/veloced-linux    # 16 checks; restores gobgpd on all routers afterwards

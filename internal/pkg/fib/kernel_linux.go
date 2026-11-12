@@ -73,6 +73,11 @@ type kernelProgrammer struct {
 	mu    sync.Mutex
 	index map[string]int
 	name  map[int]string
+
+	// Batched programming (kernel_batch_linux.go): one socket, used by one
+	// Apply at a time.
+	bmu   sync.Mutex
+	bsock *batchSocket
 }
 
 // NewKernelProgrammer returns a Programmer that manages Linux kernel routes
@@ -115,6 +120,12 @@ func NewKernelProgrammer(o KernelOptions) (interface {
 
 func (k *kernelProgrammer) Close() error {
 	k.h.Close()
+	k.bmu.Lock()
+	if k.bsock != nil {
+		k.bsock.sock.Close()
+		k.bsock = nil
+	}
+	k.bmu.Unlock()
 	return nil
 }
 

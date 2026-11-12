@@ -53,6 +53,11 @@ type config struct {
 	// FibRetry is how often prefixes whose next hop is not reachable are
 	// retried even if no network change is seen; 0 turns the timer off.
 	FibRetry time.Duration
+	// FibStats logs the kernel sync counters this often (0: never).
+	FibStats time.Duration
+	// PprofAddr serves Go's profiling endpoints (empty: off). It exposes
+	// internals, so bind it to localhost.
+	PprofAddr string
 }
 
 func parseFlags(args []string, errOut io.Writer) (*config, error) {
@@ -73,6 +78,8 @@ func parseFlags(args []string, errOut io.Writer) (*config, error) {
 	fs.BoolVar(&c.Multipath, "multipath", false, "keep every equal-cost BGP path; with -fib-sync the kernel route gets all their next hops (ECMP)")
 	fs.IntVar(&c.FibMaxPaths, "fib-max-paths", fib.DefaultMaxNextHops, "most next hops in one ECMP kernel route (with -multipath and -fib-sync)")
 	fs.DurationVar(&c.FibRetry, "fib-retry-interval", fib.DefaultRetryInterval, "how often to retry routes whose next hop was not reachable, besides on network changes (0 turns the timer off)")
+	fs.DurationVar(&c.FibStats, "fib-stats-interval", 0, "log kernel sync counters this often, for example 10s (0 turns it off)")
+	fs.StringVar(&c.PprofAddr, "pprof-address", "", "serve Go profiling endpoints on this address, for example 127.0.0.1:6060 (empty: off)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -100,6 +107,9 @@ func (c *config) validate() error {
 	}
 	if c.ListenPort < -1 || c.ListenPort > 65535 {
 		errs = append(errs, fmt.Errorf("-listen-port %d is out of range (-1 to 65535)", c.ListenPort))
+	}
+	if c.FibStats < 0 {
+		errs = append(errs, fmt.Errorf("-fib-stats-interval %s must not be negative", c.FibStats))
 	}
 	if c.GrpcAddr == "" {
 		errs = append(errs, errors.New("-grpc-address must not be empty"))

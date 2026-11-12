@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/pprof"
 	"strings"
 	"time"
 
@@ -89,6 +91,37 @@ func bgpStage(cfg *config, logger *slog.Logger, lvl *slog.LevelVar, d *daemon) s
 			// sessions cleanly), then stops BFD and the gRPC API.
 			bgp.Stop()
 			return nil
+		},
+	}
+}
+
+// pprofStage serves Go's profiling endpoints. It starts first, so a start-up
+// problem can be profiled, and stops last.
+func pprofStage(cfg *config, logger *slog.Logger) stage {
+	var srv *http.Server
+	return stage{
+		name: "pprof",
+		start: func(context.Context) error {
+			l, err := net.Listen("tcp", cfg.PprofAddr)
+			if err != nil {
+				return fmt.Errorf("pprof address %q is not available: %w", cfg.PprofAddr, err)
+			}
+			mux := http.NewServeMux()
+			mux.HandleFunc("/debug/pprof/", pprof.Index)
+			mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+			mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+			mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+			mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+			srv = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+			go srv.Serve(l)
+			logger.Info("pprof on", slog.String("address", l.Addr().String()))
+			return nil
+		},
+		stop: func(ctx context.Context) error {
+			if srv == nil {
+				return nil
+			}
+			return srv.Shutdown(ctx)
 		},
 	}
 }
@@ -166,6 +199,9 @@ func fibStage(cfg *config, logger *slog.Logger, d *daemon, k kernelRoutes) stage
 				prog.Close()
 				return err
 			}
+			if cfg.FibStats > 0 {
+				go logSyncStats(wctx, logger, syn, cfg.FibStats)
+			}
 			logger.Info("kernel route sync on",
 				slog.Int("protocol", cfg.FibProtocol), slog.Int("table", cfg.FibTable), slog.Int("metric", cfg.FibMetric),
 				slog.Bool("ecmp", cfg.Multipath), slog.Int("max_paths", cfg.FibMaxPaths))
@@ -187,6 +223,29 @@ func fibStage(cfg *config, logger *slog.Logger, d *daemon, k kernelRoutes) stage
 	}
 }
 
+// logSyncStats logs the syncer's counters every interval, only when they changed.
+func logSyncStats(ctx context.Context, logger *slog.Logger, syn *fib.Syncer, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	var last fib.Stats
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			st := syn.Stats()
+			if st == last {
+				continue
+			}
+			last = st
+			logger.Info("kernel sync",
+				slog.Int("installed", st.Installed), slog.Uint64("replaced", st.Replaced), slog.Uint64("deleted", st.Deleted),
+				slog.Uint64("batches", st.Batches), slog.Uint64("batched_ops", st.BatchedOps),
+				slog.Uint64("unreachable", st.Unreachable), slog.Uint64("errors", st.Errors), slog.Int("queue_peak", syn.QueuePeak()))
+		}
+	}
+}
+
 // run starts the daemon and blocks until ctx is cancelled (a signal, or a
 // test), then shuts down in reverse start order. It returns the start error,
 // or the shutdown errors if shutdown failed.
@@ -196,7 +255,11 @@ func run(ctx context.Context, cfg *config, logger *slog.Logger, lvl *slog.LevelV
 
 func runWithKernel(ctx context.Context, cfg *config, logger *slog.Logger, lvl *slog.LevelVar, k kernelRoutes) error {
 	d := &daemon{}
-	stages := []stage{bgpStage(cfg, logger, lvl, d)}
+	var stages []stage
+	if cfg.PprofAddr != "" {
+		stages = append(stages, pprofStage(cfg, logger))
+	}
+	stages = append(stages, bgpStage(cfg, logger, lvl, d))
 	if cfg.FibSync {
 		stages = append(stages, fibStage(cfg, logger, d, k))
 	}

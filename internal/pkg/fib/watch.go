@@ -23,12 +23,15 @@ import (
 )
 
 // Watch subscribes the syncer to best path changes of a running BGP server,
-// starting with the current best paths. The callback runs on the watcher's own
-// goroutine, one event at a time, so the syncer is the only writer of the
-// kernel table and the BGP loop never waits for netlink. Events queue without
-// bound while a callback is slow. The subscription ends when ctx is cancelled.
+// starting with the current best paths. The callback only queues a compact
+// copy of the event, so the BGP watcher never waits for the kernel; a writer
+// goroutine applies whatever has queued up as one batch (the busier the
+// kernel, the bigger the batch), so the syncer is the only writer of the kernel
+// table. The queue is unbounded: a slow kernel means memory grows, not that
+// BGP slows down. Both end when ctx is cancelled.
 func (s *Syncer) Watch(ctx context.Context, bgp *server.BgpServer) error {
+	go s.drain(ctx)
 	return bgp.WatchEvent(ctx, server.WatchEventMessageCallbacks{
-		OnBestPath: func(paths []*apiutil.Path, _ time.Time) { s.HandleBestPaths(paths) },
+		OnBestPath: func(paths []*apiutil.Path, _ time.Time) { s.Submit(paths) },
 	}, server.WatchBestPath(true))
 }

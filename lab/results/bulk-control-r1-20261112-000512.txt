@@ -1,0 +1,18 @@
+label=bulk-control-r1 n=900000 date=2026-11-12T06:05:12Z feedgen_args=-share 40 veloced_args= env=
+kernel_prefixes_before=13
+sent=900000 withdraw=false elapsed=5.438s rate=165494 paths/s
+feed_sent_seconds=5.515667000
+bgp_converged_r2_seconds=5.531701000
+kernel_programmed_seconds=NA
+kernel_lag_after_bgp_seconds=NA
+veloced_cpu_seconds=4.13
+veloced_peak_rss_mb=568
+kernel_routes_added=0
+-- veloced log tail
+time=2026-11-12T06:05:18.962Z level=INFO msg=starting stage=bgp
+time=2026-11-12T06:05:18.964Z level=INFO msg="veloced started" version=4.11.0 asn=65002 router_id=2.2.2.2 grpc=127.0.0.1:50051
+time=2026-11-12T06:05:21.082Z level=INFO msg="Add a peer configuration" Topic=Peer Key=10.0.12.1
+time=2026-11-12T06:05:21.082Z level=INFO msg="starting outgoing connection manager" Topic=Peer Key=10.0.12.1
+time=2026-11-12T06:05:21.984Z level=INFO msg="Peer Up" Topic=Peer Key=10.0.12.1
+-- stop: time for SIGTERM to remove every route
+stop_seconds=2.152017000  kernel_routes_left_after_stop=0

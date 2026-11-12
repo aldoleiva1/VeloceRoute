@@ -91,6 +91,23 @@ type Programmer interface {
 	Lookup(netip.Prefix) (Route, bool, error)
 }
 
+// Op is one change in a batch: install Route, or with Delete remove the route
+// for Route.Prefix.
+type Op struct {
+	Delete bool
+	Route  Route
+}
+
+// BatchProgrammer is a Programmer that can apply many changes with far fewer
+// system calls than one call per route. Apply runs the ops in order, a failing
+// op does not stop the others, and errs[i] is the result of ops[i] with the
+// same meaning as Replace or Delete (so deleting a route that is not there is
+// not an error). The syncer uses it when it has several changes at once.
+type BatchProgrammer interface {
+	Programmer
+	Apply(ops []Op) (errs []error)
+}
+
 // Change is a hint that the operating system's routing state moved under the
 // syncer. It is only a hint: the syncer checks the real state before acting.
 type Change struct {
@@ -119,6 +136,8 @@ type Stats struct {
 	Unreachable uint64 // next hop not reachable, route skipped
 	Recovered   uint64 // routes installed by a retry after their next hop became reachable
 	Drifted     uint64 // routes the kernel dropped or changed behind our back, restored
+	Batches     uint64 // batched kernel calls made (see BatchProgrammer)
+	BatchedOps  uint64 // changes sent in those batches
 	Errors      uint64 // other programmer errors
 	Skipped     uint64 // paths not eligible (local, unsupported family, no next hop)
 }
@@ -184,8 +203,16 @@ type Syncer struct {
 	logger      *slog.Logger
 	multipath   bool
 	maxNextHops int
+	debugLogs   bool // per-route debug logging is on; checked once so a route costs no formatting when it is off
 
 	debounce time.Duration
+
+	// Events from the BGP watcher wait here for the writer goroutine, which
+	// applies everything that piled up while it was busy as one batch.
+	qmu   sync.Mutex
+	queue []event
+	qwake chan struct{}
+	qpeak int
 
 	mu      sync.Mutex
 	entries map[netip.Prefix]entry
@@ -212,10 +239,12 @@ func NewSyncer(prog Programmer, logger *slog.Logger, opts ...Option) *Syncer {
 		pending:     map[netip.Prefix]struct{}{},
 		noZoneWarn:  map[netip.Addr]struct{}{},
 		debounce:    200 * time.Millisecond,
+		qwake:       make(chan struct{}, 1),
 	}
 	for _, o := range opts {
 		o(s)
 	}
+	s.debugLogs = logger.Enabled(context.Background(), slog.LevelDebug)
 	return s
 }
 
@@ -238,6 +267,7 @@ func (s *Syncer) Reconcile() error {
 	}
 	var errs []error
 	seen := map[netip.Prefix]struct{}{}
+	var prefixes []netip.Prefix
 	for _, r := range stale {
 		// A programmer may report one route per next hop; deleting by prefix
 		// removes them all.
@@ -245,11 +275,15 @@ func (s *Syncer) Reconcile() error {
 			continue
 		}
 		seen[r.Prefix] = struct{}{}
-		if err := s.prog.Delete(r.Prefix); err != nil {
-			errs = append(errs, fmt.Errorf("delete stale %s: %w", r.Prefix, err))
-			continue
+		prefixes = append(prefixes, r.Prefix)
+	}
+	for i, err := range s.deleteAll(prefixes) {
+		if err != nil {
+			errs = append(errs, fmt.Errorf("delete stale %s: %w", prefixes[i], err))
 		}
-		s.logger.Info("removed stale route", slog.String("route", r.String()))
+	}
+	if n := len(prefixes); n > 0 {
+		s.logger.Info("removed stale routes", slog.Int("count", n-len(errs)))
 	}
 	return errors.Join(errs...)
 }
@@ -262,12 +296,17 @@ func (s *Syncer) RemoveAll() error {
 	defer s.mu.Unlock()
 	s.stopped = true
 	var errs []error
+	prefixes := make([]netip.Prefix, 0, s.nInstalled)
 	for p, e := range s.entries {
 		if !e.installed {
 			delete(s.entries, p)
 			continue
 		}
-		if err := s.prog.Delete(p); err != nil {
+		prefixes = append(prefixes, p)
+	}
+	for i, err := range s.deleteAll(prefixes) {
+		p := prefixes[i]
+		if err != nil {
 			errs = append(errs, fmt.Errorf("delete %s: %w", p, err))
 			continue
 		}
@@ -278,46 +317,141 @@ func (s *Syncer) RemoveAll() error {
 	return errors.Join(errs...)
 }
 
+// deleteAll removes the routes for the prefixes, in one batch if the
+// programmer can, and returns one result per prefix. It keeps going after an
+// error.
+func (s *Syncer) deleteAll(prefixes []netip.Prefix) []error {
+	if bp, ok := s.prog.(BatchProgrammer); ok && len(prefixes) >= minBatch {
+		ops := make([]Op, len(prefixes))
+		for i, p := range prefixes {
+			ops[i] = Op{Delete: true, Route: Route{Prefix: p}}
+		}
+		s.stats.Batches++
+		s.stats.BatchedOps += uint64(len(ops))
+		return bp.Apply(ops)
+	}
+	errs := make([]error, len(prefixes))
+	for i, p := range prefixes {
+		errs[i] = s.prog.Delete(p)
+	}
+	return errs
+}
+
+// event is a best path event reduced to what the syncer needs. It is much
+// smaller than the path it came from, so a backlog of events costs little
+// memory.
+type event struct {
+	prefix     netip.Prefix
+	src        source
+	nh         netip.Addr
+	disp       disposition
+	withdrawal bool
+}
+
+// makeEvent has no side effects, so it can run on the watcher's goroutine.
+func makeEvent(p *apiutil.Path) event {
+	prefix, nh, disp := classify(p)
+	if disp == dispIgnore {
+		return event{disp: dispIgnore}
+	}
+	return event{prefix: prefix, src: source{peer: p.PeerAddress, id: p.RemoteID}, nh: nh, disp: disp, withdrawal: p.Withdrawal}
+}
+
 // HandleBestPaths applies one best path event.
 func (s *Syncer) HandleBestPaths(paths []*apiutil.Path) {
+	evs := make([]event, len(paths))
+	for i, p := range paths {
+		evs[i] = makeEvent(p)
+	}
+	s.handleEvents(evs)
+}
+
+// Submit queues a best path event for the writer goroutine started by Watch
+// and returns at once, so the caller (the BGP watcher) never waits for the
+// kernel. The writer applies everything queued while it was busy in one go, so
+// the more load, the bigger the batches.
+func (s *Syncer) Submit(paths []*apiutil.Path) {
+	s.qmu.Lock()
+	for _, p := range paths {
+		s.queue = append(s.queue, makeEvent(p))
+	}
+	if len(s.queue) > s.qpeak {
+		s.qpeak = len(s.queue)
+	}
+	s.qmu.Unlock()
+	select {
+	case s.qwake <- struct{}{}:
+	default:
+	}
+}
+
+// QueuePeak is the longest the event queue has been, for sizing and tests.
+func (s *Syncer) QueuePeak() int {
+	s.qmu.Lock()
+	defer s.qmu.Unlock()
+	return s.qpeak
+}
+
+// drain applies queued events until ctx ends.
+func (s *Syncer) drain(ctx context.Context) {
+	var batch []event
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.qwake:
+		}
+		for {
+			s.qmu.Lock()
+			batch, s.queue = s.queue, batch[:0]
+			s.qmu.Unlock()
+			if len(batch) == 0 {
+				break
+			}
+			s.handleEvents(batch)
+			if ctx.Err() != nil {
+				return
+			}
+		}
+	}
+}
+
+func (s *Syncer) handleEvents(evs []event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.stopped {
 		return
 	}
-	for _, p := range paths {
-		s.handle(p)
+	for i := range evs {
+		s.handle(&evs[i])
 	}
 	// Program each prefix once, from the state after the whole event, so
 	// several paths of one prefix in an event make one kernel change and the
 	// kernel never sees a half-built ECMP set.
-	for _, prefix := range s.dirty {
-		s.apply(prefix, s.entries[prefix])
-	}
+	s.flush()
 	s.dirty = s.dirty[:0]
 	clear(s.dirtySet)
 }
 
-func (s *Syncer) handle(p *apiutil.Path) {
-	prefix, nh, disp := classify(p)
-	if disp == dispIgnore {
+func (s *Syncer) handle(ev *event) {
+	if ev.disp == dispIgnore {
 		s.stats.Skipped++
 		return
 	}
-	src := source{peer: p.PeerAddress, id: p.RemoteID}
+	prefix, src, nh := ev.prefix, ev.src, ev.nh
 	e := s.entries[prefix]
-	switch disp {
+	switch ev.disp {
 	case dispRemove, dispNoInterface:
 		// A withdrawal, or a path we do not program (locally originated,
 		// unusable next hop).
-		if disp == dispNoInterface {
-			if _, warned := s.noZoneWarn[p.PeerAddress]; !warned {
-				s.noZoneWarn[p.PeerAddress] = struct{}{}
+		if ev.disp == dispNoInterface {
+			if _, warned := s.noZoneWarn[src.peer]; !warned {
+				s.noZoneWarn[src.peer] = struct{}{}
 				s.logger.Warn("routes from this peer have a link-local next hop but the peer has no interface, not programming them",
-					slog.String("peer", p.PeerAddress.String()), slog.String("next_hop", nh.String()))
+					slog.String("peer", src.peer.String()), slog.String("next_hop", nh.String()))
 			}
 		}
-		if !p.Withdrawal {
+		if !ev.withdrawal {
 			s.stats.Skipped++
 		}
 		if s.multipath {
@@ -339,6 +473,87 @@ func (s *Syncer) handle(p *apiutil.Path) {
 	if _, seen := s.dirtySet[prefix]; !seen {
 		s.dirtySet[prefix] = struct{}{}
 		s.dirty = append(s.dirty, prefix)
+	}
+}
+
+// minBatch is the fewest changes worth a batched call.
+const minBatch = 2
+
+// planned is a change waiting for a batch result.
+type planned struct {
+	prefix netip.Prefix
+	want   []netip.Addr // nil for a delete
+	before int          // next hops in the kernel route before an install
+}
+
+// flush programs the dirty prefixes. With a BatchProgrammer and enough
+// changes it sends them in one batch and finishes the common case (the kernel
+// accepted the change) without further calls; any prefix whose change was
+// refused goes through the ordinary one-at-a-time path, which knows how to
+// handle each kind of refusal.
+func (s *Syncer) flush() {
+	bp, ok := s.prog.(BatchProgrammer)
+	if !ok || len(s.dirty) < minBatch {
+		for _, prefix := range s.dirty {
+			s.apply(prefix, s.entries[prefix])
+		}
+		return
+	}
+	var (
+		plan []planned
+		ops  []Op
+	)
+	for _, prefix := range s.dirty {
+		e := s.entries[prefix]
+		want := s.wanted(prefix, e.cands)
+		switch {
+		case len(want) == 0 && !e.installed:
+			s.apply(prefix, e) // nothing in the kernel: bookkeeping only
+		case len(want) == 0:
+			plan = append(plan, planned{prefix: prefix})
+			ops = append(ops, Op{Delete: true, Route: Route{Prefix: prefix}})
+		case e.installed && slices.Equal(want, e.applied):
+			// nothing changed
+		default:
+			before := 0
+			if e.installed {
+				before = len(e.applied)
+				if e.live != nil {
+					before = len(e.live)
+				}
+			}
+			plan = append(plan, planned{prefix: prefix, want: want, before: before})
+			ops = append(ops, Op{Route: Route{Prefix: prefix, NextHops: want}})
+		}
+	}
+	if len(ops) == 0 {
+		return
+	}
+	errs := bp.Apply(ops)
+	s.stats.Batches++
+	s.stats.BatchedOps += uint64(len(ops))
+	for i, pl := range plan {
+		e := s.entries[pl.prefix]
+		if errs[i] != nil {
+			s.apply(pl.prefix, e) // the one-at-a-time path repeats the change and deals with the refusal
+			continue
+		}
+		if pl.want == nil {
+			s.recordDelete(pl.prefix, e)
+		} else {
+			s.recordInstall(pl.prefix, e, pl.want, pl.want, nil, pl.before)
+		}
+	}
+}
+
+// recordDelete is the bookkeeping after the kernel removed a route.
+func (s *Syncer) recordDelete(prefix netip.Prefix, e entry) {
+	delete(s.pending, prefix)
+	s.stats.Deleted++
+	s.nInstalled--
+	delete(s.entries, prefix)
+	if s.debugLogs {
+		s.logger.Debug("route removed", slog.String("prefix", prefix.String()))
 	}
 }
 
@@ -401,7 +616,9 @@ func (s *Syncer) apply(prefix netip.Prefix, e entry) {
 			}
 			s.stats.Deleted++
 			s.nInstalled--
-			s.logger.Debug("route removed", slog.String("prefix", prefix.String()))
+			if s.debugLogs {
+				s.logger.Debug("route removed", slog.String("prefix", prefix.String()))
+			}
 		}
 		delete(s.entries, prefix)
 	case e.installed && slices.Equal(want, e.applied):
@@ -462,6 +679,12 @@ func (s *Syncer) install(prefix netip.Prefix, want []netip.Addr, e entry, probe 
 		s.entries[prefix] = e
 		return
 	}
+	s.recordInstall(prefix, e, want, ok, skipped, before)
+}
+
+// recordInstall is the bookkeeping after the kernel accepted a route: ok are
+// the next hops that are in it and skipped the ones left out as unreachable.
+func (s *Syncer) recordInstall(prefix netip.Prefix, e entry, want, ok, skipped []netip.Addr, before int) {
 	if len(skipped) > 0 {
 		s.stats.Unreachable += uint64(len(skipped))
 		if !e.failed {
@@ -487,7 +710,9 @@ func (s *Syncer) install(prefix netip.Prefix, want []netip.Addr, e entry, probe 
 		s.logger.Info("route installed after its next hop became reachable", slog.String("route", Route{Prefix: prefix, NextHops: ok}.String()))
 	}
 	s.entries[prefix] = e
-	s.logger.Debug("route installed", slog.String("route", r.String()))
+	if s.debugLogs {
+		s.logger.Debug("route installed", slog.String("route", Route{Prefix: prefix, NextHops: want}.String()))
+	}
 }
 
 // installReachable is the fallback for an ECMP route the kernel refused

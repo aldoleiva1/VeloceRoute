@@ -17,8 +17,10 @@ package fib
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"runtime"
 	"slices"
 	"strconv"
@@ -888,5 +890,285 @@ func TestKernelSyncerBindsLinkLocalNextHopToThePeerInterface(t *testing.T) {
 	rs := n.find(netlink.FAMILY_V6, "2001:db8:50::/48")
 	if len(rs) != 1 || rs[0].LinkIndex != n.ifindex("v0") {
 		t.Fatalf("not installed on v0: %v (stats %+v)", rs, s.Stats())
+	}
+}
+
+// ---- batched programming (task E4-5) ----
+
+type batchProg interface {
+	BatchProgrammer
+	Close() error
+}
+
+func (n *testNS) batchProgrammer(t *testing.T) batchProg {
+	t.Helper()
+	return n.programmer(t).(batchProg)
+}
+
+// applyOneByOne is what a batch must be equivalent to.
+func applyOneByOne(p Programmer, ops []Op) []error {
+	errs := make([]error, len(ops))
+	for i, op := range ops {
+		if op.Delete {
+			errs[i] = p.Delete(op.Route.Prefix)
+		} else {
+			errs[i] = p.Replace(op.Route)
+		}
+	}
+	return errs
+}
+
+func kind(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, ErrNextHopUnreachable):
+		return "unreachable"
+	}
+	return "other"
+}
+
+// The same operations through a batch and through single calls, in two
+// namespaces, must leave identical routes and give the same kind of result for
+// every operation: IPv4 and IPv6, single and ECMP, link-local with an interface,
+// a replace of an existing route, deletes (also of a route that is not there),
+// and refusals in the middle and at both ends of the batch.
+func TestKernelBatchMatchesSingleCalls(t *testing.T) {
+	setup := func() (*testNS, batchProg) {
+		n := newTestNS(t)
+		v0, _ := n.h.LinkByName("v0")
+		if !n.addr(v0, "2001:db8:12::1/64") {
+			t.Skip("IPv6 is not available in this environment")
+		}
+		return n, n.batchProgrammer(t)
+	}
+	nb, pb := setup()
+	ns, ps := setup()
+
+	ops := []Op{
+		{Route: rt(pfx("172.31.255.0/24"), ip("172.31.255.1"))},                          // refused: first in the batch
+		{Route: rt(pfx("192.0.2.0/24"), ip("10.0.12.2"))},                                // v4 single
+		{Route: rt(pfx("198.51.100.0/24"), ip("10.0.12.2"), ip("10.0.12.3"))},            // v4 ecmp
+		{Route: rt(pfx("203.0.113.0/24"), ip("10.0.12.2"), ip("172.31.255.1"))},          // refused ecmp
+		{Route: rt(pfx("2001:db8:50::/48"), ip("2001:db8:12::2"))},                       // v6 single
+		{Route: rt(pfx("2001:db8:51::/48"), ip("2001:db8:12::2"), ip("2001:db8:12::3"))}, // v6 ecmp
+		{Route: rt(pfx("2001:db8:52::/48"), ip("fe80::2%v0"))},                           // link-local with interface
+		{Route: rt(pfx("2001:db8:53::/48"), ip("fe80::2"))},                              // refused: link-local without interface
+		{Route: rt(pfx("2001:db8:54::/48"), ip("fe80::2%nosuch0"))},                      // unknown interface
+		{Route: rt(pfx("192.0.2.0/24"), ip("10.0.12.3"))},                                // replace the first route
+		{Route: rt(pfx("0.0.0.0/0"), ip("10.0.12.2"))},                                   // default route
+		{Delete: true, Route: Route{Prefix: pfx("198.51.100.0/24")}},                     // delete ecmp
+		{Delete: true, Route: Route{Prefix: pfx("10.250.0.0/16")}},                       // delete a route that is not there
+		{Route: rt(pfx("10.20.0.0/16"), ip("172.31.255.1"))},                             // refused: last in the batch
+	}
+	be, se := pb.Apply(ops), applyOneByOne(ps, ops)
+	for i := range ops {
+		if kind(be[i]) != kind(se[i]) {
+			t.Errorf("op %d (%+v): batch %v, single %v", i, ops[i], be[i], se[i])
+		}
+	}
+	bo, _ := pb.ListOwned()
+	so, _ := ps.ListOwned()
+	key := func(rs []Route) []string {
+		var out []string
+		for _, r := range rs {
+			out = append(out, fmt.Sprintf("%s>%v", r.Prefix, r.NextHops))
+		}
+		slices.Sort(out)
+		return out
+	}
+	if !slices.Equal(key(bo), key(so)) {
+		t.Fatalf("different routes\nbatch:  %v\nsingle: %v", key(bo), key(so))
+	}
+	if len(bo) == 0 {
+		t.Fatal("nothing was installed")
+	}
+	// Not just our listing: every field the kernel has, including scope, type, protocol and metric.
+	full := func(n *testNS, family int) []string {
+		var out []string
+		for _, r := range n.routes(family) {
+			if r.Protocol != DefaultProtocol {
+				continue
+			}
+			s := fmt.Sprintf("%v gw=%v oif=%d prio=%d proto=%d scope=%v type=%d", r.Dst, r.Gw, r.LinkIndex, r.Priority, r.Protocol, r.Scope, r.Type)
+			for _, h := range r.MultiPath {
+				s += fmt.Sprintf(" nh(%v,%d,%d)", h.Gw, h.LinkIndex, h.Hops)
+			}
+			out = append(out, s)
+		}
+		slices.Sort(out)
+		return out
+	}
+	for _, fam := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
+		if a, b := full(nb, fam), full(ns, fam); !slices.Equal(a, b) {
+			t.Fatalf("family %d differs in detail\nbatch:  %v\nsingle: %v", fam, a, b)
+		}
+	}
+	// The routes it deleted are gone, the ones it replaced carry the new next hop.
+	if got := nb.find(netlink.FAMILY_V4, "198.51.100.0/24"); len(got) != 0 {
+		t.Fatalf("deleted route still there: %v", got)
+	}
+	if got := nb.find(netlink.FAMILY_V4, "192.0.2.0/24"); len(got) != 1 || got[0].Gw.String() != "10.0.12.3" {
+		t.Fatalf("replace in the batch: %v", got)
+	}
+}
+
+// More changes than one buffer holds go out in several, in order, and a refusal
+// is attributed to the right operation whichever buffer it is in.
+func TestKernelBatchLarge(t *testing.T) {
+	n := newTestNS(t)
+	p := n.batchProgrammer(t)
+	const total = 5000 // several buffers of maxBatchMsgs
+	ops := make([]Op, 0, total)
+	for i := 0; i < total; i++ {
+		nh := "10.0.12.2"
+		if i == 17 || i == 1500 || i == total-1 {
+			nh = "172.31.255.1" // refused
+		}
+		ops = append(ops, Op{Route: rt(netip.PrefixFrom(netip.AddrFrom4([4]byte{10, byte(100 + i/256/256), byte(i / 256), byte(i)}), 32), ip(nh))})
+	}
+	errs := p.Apply(ops)
+	bad := 0
+	for i, e := range errs {
+		want := i == 17 || i == 1500 || i == total-1
+		if (e != nil) != want || (e != nil && !errors.Is(e, ErrNextHopUnreachable)) {
+			t.Fatalf("op %d: err %v, want refused=%v", i, e, want)
+		}
+		if e != nil {
+			bad++
+		}
+	}
+	owned, err := p.ListOwned()
+	if err != nil || len(owned) != total-bad {
+		t.Fatalf("installed %d, want %d (err %v)", len(owned), total-bad, err)
+	}
+	// Delete them all in one call; deleting what was never installed is not an error.
+	dels := make([]Op, len(ops))
+	for i, op := range ops {
+		dels[i] = Op{Delete: true, Route: Route{Prefix: op.Route.Prefix}}
+	}
+	for i, e := range p.Apply(dels) {
+		if e != nil {
+			t.Fatalf("delete %d: %v", i, e)
+		}
+	}
+	if owned, _ := p.ListOwned(); len(owned) != 0 {
+		t.Fatalf("%d routes left", len(owned))
+	}
+}
+
+// Batched calls and ordinary calls on the same programmer, and an empty batch.
+func TestKernelBatchMixedWithSingleCalls(t *testing.T) {
+	n := newTestNS(t)
+	p := n.batchProgrammer(t)
+	if errs := p.Apply(nil); len(errs) != 0 {
+		t.Fatalf("empty batch: %v", errs)
+	}
+	if err := p.Replace(rt(pfx("192.0.2.0/24"), ip("10.0.12.2"))); err != nil {
+		t.Fatal(err)
+	}
+	if e := p.Apply([]Op{{Route: rt(pfx("198.51.100.0/24"), ip("10.0.12.2"))}, {Delete: true, Route: Route{Prefix: pfx("192.0.2.0/24")}}}); e[0] != nil || e[1] != nil {
+		t.Fatalf("%v", e)
+	}
+	owned, _ := p.ListOwned()
+	if len(owned) != 1 || owned[0].Prefix != pfx("198.51.100.0/24") {
+		t.Fatalf("%v", owned)
+	}
+	// The batch never touches a foreign route for the same prefix.
+	if err := n.h.RouteAdd(&netlink.Route{Dst: ipNet(pfx("203.0.113.0/24")), Gw: net.ParseIP("10.0.12.9"), Table: unix.RT_TABLE_MAIN, Protocol: unix.RTPROT_STATIC}); err != nil {
+		t.Fatal(err)
+	}
+	if e := p.Apply([]Op{{Route: rt(pfx("203.0.113.0/24"), ip("10.0.12.2"))}, {Delete: true, Route: Route{Prefix: pfx("203.0.113.0/24")}}}); e[0] != nil || e[1] != nil {
+		t.Fatalf("%v", e)
+	}
+	rs := n.find(netlink.FAMILY_V4, "203.0.113.0/24")
+	if len(rs) != 1 || rs[0].Protocol != unix.RTPROT_STATIC {
+		t.Fatalf("the static route did not survive: %v", rs)
+	}
+}
+
+// The syncer on a real kernel with a big event: one batch, same result.
+func TestKernelSyncerUsesBatches(t *testing.T) {
+	n := newTestNS(t)
+	p := n.batchProgrammer(t)
+	s := NewSyncer(p, quiet())
+	var paths []*apiutil.Path
+	for i := 0; i < 3000; i++ {
+		paths = append(paths, v4(t, fmt.Sprintf("10.%d.%d.0/24", 100+i/256, i%256), "10.0.12.2"))
+	}
+	paths = append(paths, v4(t, "172.16.0.0/16", "172.31.255.1")) // refused: waits
+	s.HandleBestPaths(paths)
+	st := s.Stats()
+	if st.Installed != 3000 || st.Unreachable != 1 || st.Batches != 1 {
+		t.Fatalf("%+v", st)
+	}
+	if owned, _ := p.ListOwned(); len(owned) != 3000 {
+		t.Fatalf("%d routes in the kernel", len(owned))
+	}
+	if err := s.RemoveAll(); err != nil {
+		t.Fatal(err)
+	}
+	if owned, _ := p.ListOwned(); len(owned) != 0 {
+		t.Fatalf("%d routes left", len(owned))
+	}
+}
+
+// TestKernelScale times the kernel side at a big table. It does nothing unless
+// FIB_SCALE_N is set (for example 900000), because it takes seconds and a lot of
+// memory:
+//
+//	FIB_SCALE_N=900000 /fib.test -test.run TestKernelScale -test.v
+func TestKernelScale(t *testing.T) {
+	nStr := os.Getenv("FIB_SCALE_N")
+	if nStr == "" {
+		t.Skip("set FIB_SCALE_N to run")
+	}
+	total, err := strconv.Atoi(nStr)
+	if err != nil || total < 1 {
+		t.Fatalf("FIB_SCALE_N=%q", nStr)
+	}
+	n := newTestNS(t)
+	p := n.batchProgrammer(t)
+	s := NewSyncer(p, quiet())
+
+	// Events of the size GoBGP produces (a few dozen paths at a time).
+	const per = 40
+	mk := func(i int) *apiutil.Path {
+		return v4(t, fmt.Sprintf("%d.%d.%d.0/24", 11+i>>16, (i>>8)&255, i&255), "10.0.12.2")
+	}
+	start := time.Now()
+	for i := 0; i < total; {
+		var evs []*apiutil.Path
+		for j := 0; j < per && i < total; j, i = j+1, i+1 {
+			evs = append(evs, mk(i))
+		}
+		s.HandleBestPaths(evs)
+	}
+	t.Logf("install %d routes in events of %d: %v (%d batches)", total, per, time.Since(start).Round(time.Millisecond), s.Stats().Batches)
+	if got := s.Stats().Installed; got != total {
+		t.Fatalf("installed %d", got)
+	}
+
+	// The same through one queue-sized batch.
+	start = time.Now()
+	owned, err := p.ListOwned()
+	t.Logf("ListOwned: %d routes in %v", len(owned), time.Since(start).Round(time.Millisecond))
+	if err != nil || len(owned) != total {
+		t.Fatalf("ListOwned %d, %v", len(owned), err)
+	}
+	start = time.Now()
+	s.VerifyAll()
+	t.Logf("VerifyAll (nothing missing): %v", time.Since(start).Round(time.Millisecond))
+	if s.Stats().Drifted != 0 {
+		t.Fatalf("drift reported: %+v", s.Stats())
+	}
+
+	start = time.Now()
+	if err := s.RemoveAll(); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("RemoveAll: %v", time.Since(start).Round(time.Millisecond))
+	if owned, _ := p.ListOwned(); len(owned) != 0 {
+		t.Fatalf("%d routes left", len(owned))
 	}
 }

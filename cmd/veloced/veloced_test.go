@@ -21,6 +21,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/netip"
 	"runtime"
 	"strings"
@@ -449,6 +450,50 @@ func TestFibRetryIntervalFlag(t *testing.T) {
 		t.Fatalf("0 must turn the timer off: %+v %v", c, err)
 	}
 	if _, err := parseFlags(append(append([]string{}, base...), "-fib-retry-interval", "-1s"), io.Discard); err == nil {
+		t.Fatal("a negative interval must be refused")
+	}
+}
+
+func TestPprofStageServesAndStops(t *testing.T) {
+	addr := freePort(t)
+	cfg := &config{PprofAddr: addr}
+	logger, _ := newLogger(&config{LogLevel: "error", LogFormat: "text"}, io.Discard)
+	st := pprofStage(cfg, logger)
+	if err := st.start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Get("http://" + addr + "/debug/pprof/")
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("pprof index: %v %v", resp, err)
+	}
+	resp.Body.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := st.stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
+		c.Close()
+		t.Fatal("pprof still listening after stop")
+	}
+}
+
+func TestPprofAddressInUseFailsTheStart(t *testing.T) {
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer l.Close()
+	logger, _ := newLogger(&config{LogLevel: "error", LogFormat: "text"}, io.Discard)
+	if err := pprofStage(&config{PprofAddr: l.Addr().String()}, logger).start(context.Background()); err == nil {
+		t.Fatal("a taken address must be reported")
+	}
+}
+
+func TestStatsAndPprofFlags(t *testing.T) {
+	base := []string{"-asn", "65001", "-router-id", "10.0.0.1"}
+	c, err := parseFlags(append(append([]string{}, base...), "-fib-stats-interval", "5s", "-pprof-address", "127.0.0.1:6060"), io.Discard)
+	if err != nil || c.FibStats != 5*time.Second || c.PprofAddr != "127.0.0.1:6060" {
+		t.Fatalf("%+v %v", c, err)
+	}
+	if _, err := parseFlags(append(append([]string{}, base...), "-fib-stats-interval", "-1s"), io.Discard); err == nil {
 		t.Fatal("a negative interval must be refused")
 	}
 }

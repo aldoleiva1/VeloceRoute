@@ -1,0 +1,18 @@
+label=bulk-after-r1 n=900000 date=2026-11-12T06:04:45Z feedgen_args=-share 40 veloced_args=-fib-stats-interval 2s env=
+kernel_prefixes_before=13
+sent=900000 withdraw=false elapsed=6.392s rate=140792 paths/s
+feed_sent_seconds=6.484553000
+bgp_converged_r2_seconds=6.503304000
+kernel_programmed_seconds=6.503304000
+kernel_lag_after_bgp_seconds=0
+veloced_cpu_seconds=12.57
+veloced_peak_rss_mb=1051
+kernel_routes_added=900000
+-- veloced log tail
+time=2026-11-12T06:04:53.849Z level=INFO msg="Peer Up" Topic=Peer Key=10.0.12.1
+time=2026-11-12T06:04:57.360Z level=INFO msg="kernel sync" installed=46004 replaced=46004 deleted=0 batches=1499 batched_ops=45760 unreachable=0 errors=0 queue_peak=1649
+time=2026-11-12T06:04:59.358Z level=INFO msg="kernel sync" installed=348046 replaced=348046 deleted=0 batches=10307 batched_ops=346224 unreachable=0 errors=0 queue_peak=3655
+time=2026-11-12T06:05:01.358Z level=INFO msg="kernel sync" installed=616002 replaced=616002 deleted=0 batches=16513 batched_ops=613089 unreachable=0 errors=0 queue_peak=19114
+time=2026-11-12T06:05:03.359Z level=INFO msg="kernel sync" installed=889000 replaced=889000 deleted=0 batches=25242 batched_ops=884620 unreachable=0 errors=0 queue_peak=19114
+-- stop: time for SIGTERM to remove every route
+stop_seconds=2.626836000  kernel_routes_left_after_stop=0

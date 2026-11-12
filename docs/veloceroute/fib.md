@@ -2,7 +2,7 @@
 
 `veloced -fib-sync` copies BGP best paths into the Linux kernel routing table, so
 the host actually forwards traffic along what BGP learned. GoBGP by itself only
-computes routes. Roadmap tasks E4-1, E4-2 (next hop retry, recovery, link-local binding) and E4-3 (ECMP); see [ROADMAP.md](../../ROADMAP.md) section E4 for
+computes routes. Roadmap tasks E4-1, E4-2 (next hop retry, recovery, link-local binding), E4-3 (ECMP) and E4-5 (bulk programming at 900k); see [ROADMAP.md](../../ROADMAP.md) section E4 for
 what is still to come.
 
 Source: [`internal/pkg/fib/`](../../internal/pkg/fib/), wired into
@@ -23,6 +23,8 @@ ip route show proto 201                                   # the routes veloced o
 | `-fib-metric` | 20 | route metric; must be at least 1 (see below) |
 | `-multipath` | off | keep every equal-cost BGP path, so the kernel route gets all their next hops (see ECMP) |
 | `-fib-max-paths` | 64 | most next hops in one ECMP route (used with `-multipath`) |
+| `-fib-stats-interval` | off | log the sync counters this often when they change, for example `10s` |
+| `-pprof-address` | off | serve Go profiling endpoints (bind it to localhost) |
 | `-fib-retry-interval` | 30s | safety-net timer for retrying routes whose next hop was unreachable (0 turns it off; network changes always trigger a retry) |
 
 Peers are not configurable from a file yet (task E2-2); add them with the `gobgp`
@@ -50,6 +52,66 @@ CLI against the daemon's gRPC API, for example `gobgp neighbor add 10.0.12.1 as 
    - anything else (other address families, labeled or VPN prefixes): ignored.
 4. **Stop** (before `bgp` stops). It removes every route it installed and ignores
    events still in flight, so a late event cannot put a route back after cleanup.
+
+## Bulk programming (E4-5)
+
+Measured on the lab (r2 with `veloced -fib-sync`, 900,000 /24s from r1 with `-share 40`,
+Docker Desktop arm64 VM, three runs each, interleaved; `lab/fib-bulk.sh`,
+`lab/summarize-bulk.sh`, results in `lab/results/bulk*-r*.txt`):
+
+| | BGP converged | kernel table complete | veloced CPU | peak memory | SIGTERM removes all |
+|---|---|---|---|---|---|
+| one netlink call per route (before) | 6.3-6.7 s | 8.4-9.1 s (2.1-2.6 s after BGP) | 17.3-19.2 s | 1.29-1.41 GB | 6.7-7.2 s |
+| batched (now) | 6.4-6.5 s | **same moment as BGP** | **11.0-12.7 s** | **0.98-1.03 GB** | **2.6-3.1 s** |
+| batched, `GOGC=200` | 6.2-6.8 s | same moment as BGP | 8.3-10.0 s | 1.08-1.10 GB | 2.6-3.2 s |
+| control: no kernel sync | 5.5-5.8 s | n/a | 4.1-5.2 s | 0.55-0.57 GB | 2.1-2.2 s |
+
+(The kernel is polled every 0.5 s, so "same moment" means within that.) Kernel sync of the
+whole table is no longer a tail after BGP converges, CPU is down by a third and memory by
+a quarter. `GOGC=200` is a further third off CPU for 100 MB; making it the default is
+task E2-5, not done here.
+
+**How.**
+- **Group-commit queue.** The BGP watcher callback (`Watch`) only appends a compact copy of
+  each best path event (about 90 bytes, not the multi-KB path) to a queue and returns;
+  a writer goroutine takes everything that has queued up while it was busy and applies it
+  as one batch. A slower kernel means bigger batches, not a stalled BGP. Order is kept, and
+  several events for one prefix collapse into one change. The queue is unbounded, as before.
+- **One system call for many routes.** A `BatchProgrammer` applies a list of changes.
+  The Linux one builds RTM_NEWROUTE / RTM_DELROUTE messages straight into one reused buffer
+  (no per-route objects) and sends up to 1024 messages or 64 KiB per `sendto`. Only the
+  last message of a buffer asks for an acknowledgement: the kernel always answers a message
+  that fails, and it handles messages in order, so the final acknowledgement means all
+  earlier ones are done, and the errors that came before it name the ones that failed (by
+  sequence number). Results mean the same as `Replace` and `Delete` (a delete of a route
+  that is not there is fine; an unreachable gateway is `ErrNextHopUnreachable`).
+- **A refused change takes the old path.** Anything the kernel refused inside a batch is
+  repeated through the one-at-a-time code, which already knows what to do with each kind of
+  refusal (wait for the next hop, probe an ECMP set, log). So the batch is only a fast path
+  for the common case, and a test applies random events with and without batching and
+  checks that the table and every counter come out the same.
+- **Start and stop are batched too.** Removing stale routes at start and all routes at
+  stop go through the same call: stopping with 900k routes took 6.7-7.2 s, now 2.6-3.1 s
+  (2.1 s of that is GoBGP shutting down with a full table).
+- Per-route debug logging no longer formats anything when debug is off.
+
+**Where the time goes now** (CPU profile of one batched import, 12.1 s of samples,
+`lab/results/prof/fibbatch_*`; `-pprof-address` makes this repeatable): garbage collection
+is 54% of the CPU. The syncer's own work (`drain`) is 16%, and only 0.9 s of it is the
+kernel call (`Apply`), mostly kernel time inserting routes. In the BGP loop, preparing
+events for the watcher (`notifyBestWatcher`, cloning paths) costs 0.44 s, and turning them
+into API paths in the watcher goroutine 0.31 s. That cloning is why BGP converges about
+0.7 s (12%) later than the control: the kernel write no longer blocks BGP, but producing
+the events still does a little. Removing it needs zero-copy watch events (task E1-6).
+Live memory after the import: our per-prefix state is 168 MB (about 190 bytes per prefix:
+the map slot plus a candidate and the applied next hops); the rest of the 0.43 GB over the
+control is garbage waiting for the collector.
+
+**The kernel side alone at 900k** (`FIB_SCALE_N=900000 /fib.test -test.run TestKernelScale`,
+real kernel, events of 40 paths): install 1.9 s (22,500 batches), list all our routes
+1.0 s, `VerifyAll` 1.2 s, remove all 0.6 s. So the kernel is not the bottleneck, and the
+check after a link or address change (E4-2) costs about 1.2 s at 900k. It runs once per
+burst and holds the syncer's lock; events queue meanwhile.
 
 ## Next hops that are not reachable, and routes the kernel drops (E4-2)
 
@@ -222,6 +284,19 @@ address removed and re-added, link flap with an ECMP route, and a next hop whose
 appears later. I planted five bugs (probing on every retry, ignoring changed next hops,
 counting every retry, never pending, zone not applied) and each made tests fail.
 
+E4-5 adds portable tests (a fake batch programmer): many changes go in one batch,
+unchanged ones are not sent, one change is not worth a batch, a refusal inside a batch
+is handled as usual (also a partial ECMP route), a failed delete stays tracked,
+Reconcile and RemoveAll batch, the random with-and-without-batching comparison, and the queue
+(order kept, big batches under a slow kernel, stops with its context, nothing applied after
+RemoveAll). Kernel tests compare a batch with single calls in two namespaces, down to
+scope, type, protocol, metric and each ECMP next hop, over IPv4, IPv6, link-local with an
+interface, replace, delete, deleting a missing route and refusals first, in the middle
+and last; 5,000 routes across several buffers with refusals attributed to the right
+operation; a batch mixed with single calls and a foreign route; and the syncer using a
+batch on a real kernel. I planted two bugs in the encoder (an error attributed to the
+wrong operation, routes not stamped with our protocol) and both made tests fail.
+
 **Live E4-2 test in the lab** (`lab/retry-demo.sh`, output in `lab/results/retry-live-test.txt`,
 16 checks, all pass): a prefix whose next hop network r2 does not have yet is not
 installed and is logged once; adding the network installs it; removing and re-adding the
@@ -259,18 +334,21 @@ meaning the current namespace) with a regression test of the default path.
   gRPC API after start) but `veloced` was not given `-multipath`, the syncer would read
   per-path events as best paths and the last path would win. Use the flag.
 - **ECMP has no weights**, and uses one route per prefix with inline next hops, not
-  kernel next hop objects (`nhid`). At 900k prefixes the per-prefix state of the
-  syncer (paths, applied next hops) has not been measured (task E4-5).
+  kernel next hop objects (`nhid`). ECMP at 900k prefixes has not been measured; the
+  numbers above are single-path.
 - **No recursive next hop resolution** (see above): next hops must be on a connected network.
 - **Recovery looks at all our routes.** Finding one route in the kernel means listing them
   (the kernel cannot fetch a route by exact prefix), so a link or address change costs
-  one pass over our routes. At 900k routes that has not been measured (task E4-5). Changes
-  are debounced, so a burst is one pass.
+  one pass over our routes: 1.2 s at 900k (see Bulk programming). Changes are debounced,
+  so a burst is one pass.
 - Retry and recovery need the netlink subscription. If it cannot be set up, the daemon
   refuses to start.
-- **No batching.** One netlink call per route; the 900k-route table has not been
-  measured (task E4-5). The watcher queue is unbounded, so a slow kernel means memory
-  grows, not that BGP slows down.
+- **The event queue is unbounded**, so a slow kernel means memory grows (about 90 bytes per
+  waiting event), not that BGP slows down.
+- **Per-prefix memory** is about 190 bytes (168 MB at 900k). It could be cut by interning
+  addresses and storing the common single-path case inline; not done.
+- **Batching is Linux only** (there is no other programmer). `Apply` serializes with
+  itself; if the batch socket fails it is dropped and reopened on the next call.
 - IPv4 and IPv6 unicast only, and the next hop must be the same family as the prefix
   (an IPv4 prefix with an IPv6 next hop is skipped).
 - Tested on the Docker Desktop Linux VM kernel (arm64). Not yet in CI (tasks A-6, E4-6).
