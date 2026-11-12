@@ -90,3 +90,23 @@ shutdown on SIGTERM, and the Linux one runs inside the minimal Alpine lab image
 - No TLS or authentication on the gRPC API yet (task E8-1); keep it on localhost.
 - No config file, reload, WireGuard or AWS support yet. Peers can only be added through the gRPC API (for example with the `gobgp` CLI).
 - The Go module path is still `github.com/osrg/gobgp/v4` (decision A-4 is open).
+
+## Go garbage collector defaults
+
+At start-up `veloced` sets the Go collector from the memory it may use (task E2-5):
+
+- **Memory available** is the container limit (cgroup v2 `memory.max`, or v1
+  `memory.limit_in_bytes`) if it is below the host's `MemTotal`, else `MemTotal`. If
+  neither can be read (not Linux), nothing is set.
+- **`GOGC`** is 200, which takes about a fifth off CPU for a full-table import for about a
+  quarter more memory ([performance.md](performance.md#gogc-and-gomemlimit-experiments-e1-5)).
+  Below 2 GiB available it stays at Go's default of 100.
+- **Soft memory limit** is 75% of the memory available, so a big table collects harder
+  instead of getting the process killed.
+- **`GOGC` and `GOMEMLIMIT` in the environment always win**, each separately.
+
+The start-up log line `go gc settings` shows what was chosen and why (`gogc=0` with
+`gogc_from=env` means the environment value was left alone). The limit is soft: it is not
+a guarantee, and the heap is only part of the process's memory. Checked in the lab with
+`docker run --memory`: 1 GiB gives `GOGC=100` and a 768 MiB limit, 4 GiB gives
+`GOGC=200` and 3 GiB, and with no container limit the host's memory is used.

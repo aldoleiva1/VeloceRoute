@@ -77,7 +77,7 @@ Baseline to beat (r2, 900k import, mean of 3, upstream): 193.8 mallocs/route, 8.
 | E2-1 | **Done.** `cmd/veloced` skeleton: `server.NewBgpServer`, `StartBgp`, signal handling, structured logging | Binary starts and serves the existing gRPC API | A-3 |
 | E2-2 | Config schema (TOML/YAML) for global BGP, neighbors, WireGuard interfaces, kernel sync, AWS. New fields go into `proto/api/gobgp.proto` first (CLAUDE.md rule 4), then regenerate | Config file loads and validates; invalid files give clear errors | A-4 |
 | E2-3 | Lifecycle: ordered start (WG up, BGP up, FIB sync) and ordered stop (withdraw routes, remove kernel routes, close tunnels); hot reload on SIGHUP | Integration test starts, reloads and stops cleanly with no leftover interfaces or routes | E3-1, E4-1 |
-| E2-5 | Set the Go GC defaults at startup (`debug.SetGCPercent(200)` and `debug.SetMemoryLimit` from the cgroup or instance memory, about 75-80%), overridable by `GOGC`/`GOMEMLIMIT` | Starts with the E1-5 recommended settings; env vars still win; a test checks the limit is derived from the container memory | E2-1, E1-5 |
+| E2-5 | **Done.** Set the Go GC defaults at startup (`debug.SetGCPercent(200)` and `debug.SetMemoryLimit` from the cgroup or instance memory, about 75-80%), overridable by `GOGC`/`GOMEMLIMIT` | Starts with the E1-5 recommended settings; env vars still win; a test checks the limit is derived from the container memory | E2-1, E1-5 |
 | E2-4 | Static build (`CGO_ENABLED=0`), size and startup check | `veloced` runs on a minimal image with no libc | E2-1 |
 
 ## E3. WireGuard engine (P1)

@@ -1,0 +1,18 @@
+label=gcdefault-r2 n=900000 date=2026-11-12T10:01:56Z feedgen_args=-share 40 veloced_args= env=
+kernel_prefixes_before=13
+sent=900000 withdraw=false elapsed=6.259s rate=143789 paths/s
+feed_sent_seconds=6.334365000
+bgp_converged_r2_seconds=6.352518000
+kernel_programmed_seconds=6.352518000
+kernel_lag_after_bgp_seconds=0
+veloced_cpu_seconds=8.93
+veloced_peak_rss_mb=1137
+kernel_routes_added=900000
+-- veloced log tail
+time=2026-11-12T10:02:03.042Z level=INFO msg="kernel route sync on" protocol=201 table=254 metric=20 ecmp=false max_paths=64
+time=2026-11-12T10:02:03.042Z level=INFO msg="veloced started" version=4.11.0 asn=65002 router_id=2.2.2.2 grpc=127.0.0.1:50051
+time=2026-11-12T10:02:05.143Z level=INFO msg="Add a peer configuration" Topic=Peer Key=10.0.12.1
+time=2026-11-12T10:02:05.143Z level=INFO msg="starting outgoing connection manager" Topic=Peer Key=10.0.12.1
+time=2026-11-12T10:02:05.302Z level=INFO msg="Peer Up" Topic=Peer Key=10.0.12.1
+-- stop: time for SIGTERM to remove every route
+stop_seconds=3.125931000  kernel_routes_left_after_stop=0

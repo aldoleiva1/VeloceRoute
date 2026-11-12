@@ -111,8 +111,8 @@ so a large table cannot push the host into swap or the OOM killer. Expect about 
 more memory for 18% less CPU during a full-table import. Choose `GOGC=100` on small
 instances. Not recommended: `GOGC=off`. These numbers are for one 900k-route import
 into one router; steady-state memory under churn, IPv6 and many peers were not measured.
-`veloced` (E2) should set these defaults itself from the cgroup/instance memory;
-until then set them in the environment:
+`veloced` now sets these defaults itself (see veloced.md); for `gobgpd`
+set them in the environment:
 
 ```bash
 # on a Linux router where gobgpd is installed on the PATH
@@ -375,6 +375,6 @@ Tracked in [`ROADMAP.md`](../../ROADMAP.md):
 - Remaining 10 encode allocations: the per-UPDATE attribute-presence map, the
   options slice and small per-attribute buffers.
 - Remaining table-layer sites listed under change 6 (E1-3 is partly done).
-- `veloced` choosing `GOGC`/`GOMEMLIMIT` defaults from the instance memory (E2).
+- (done in E2-5) `veloced` chooses `GOGC`/`GOMEMLIMIT` defaults from the instance memory.
 - Zero-copy `WatchEvent()` for local consumers, proto first (E1-6).
 - Decoupling the Peer FSM loop (E1-7), the riskiest item, last.

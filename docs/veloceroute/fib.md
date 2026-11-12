@@ -68,8 +68,9 @@ Docker Desktop arm64 VM, three runs each, interleaved; `lab/fib-bulk.sh`,
 
 (The kernel is polled every 0.5 s, so "same moment" means within that.) Kernel sync of the
 whole table is no longer a tail after BGP converges, CPU is down by a third and memory by
-a quarter. `GOGC=200` is a further third off CPU for 100 MB; making it the default is
-task E2-5, not done here.
+a quarter. `GOGC=200` is a further third off CPU for 100 MB; `veloced` now uses it by
+default (see [veloced.md](veloced.md#go-garbage-collector-defaults)), and a run with no
+environment settings gave 8.9-10.1 s CPU and 1.13-1.32 GB, the same as the `GOGC=200` row.
 
 **How.**
 - **Group-commit queue.** The BGP watcher callback (`Watch`) only appends a compact copy of

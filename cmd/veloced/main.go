@@ -45,6 +45,7 @@ func main() {
 		return
 	}
 	logger, lvl := newLogger(cfg, stderr())
+	applyGC(logger)
 
 	// SIGINT and SIGTERM stop the daemon. SIGHUP is reserved for config reload
 	// (task E2-3) and is only logged for now.
